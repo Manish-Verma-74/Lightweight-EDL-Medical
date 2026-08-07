@@ -42,17 +42,33 @@ def compute_ece(confidences, predictions, labels, n_bins: int = 15):
     return float(ece), bin_data
 
 
-def plot_reliability_diagram(bin_data, save_path: str = None, title: str = "Reliability Diagram"):
-    """Draws a reliability diagram (accuracy vs confidence bars + perfect-calibration line)."""
+def plot_reliability_diagram(bin_data, n_bins: int, save_path: str = None, title: str = "Reliability Diagram"):
+    """
+    Draws a reliability diagram (accuracy vs confidence bars + perfect-calibration line).
+
+    bin_data only contains NON-EMPTY bins (see compute_ece), but we still draw all
+    `n_bins` slots at a fixed width -- empty bins are drawn at zero height. This keeps
+    bar width constant and the x-axis correctly interpretable as equal-width confidence
+    intervals, matching how reliability diagrams are drawn in published papers.
+    """
     import matplotlib.pyplot as plt
 
     fig, ax = plt.subplots(figsize=(6, 6))
-    if bin_data:
-        lowers = [b[0] for b in bin_data]
-        accs = [b[2] for b in bin_data]
-        width = 1.0 / len(bin_data)
-        ax.bar(lowers, accs, width=width, align="edge", edgecolor="black",
-               color="#4C72B0", label="Model accuracy")
+
+    bin_edges = np.linspace(0, 1, n_bins + 1)
+    bin_lowers = bin_edges[:-1]
+    width = 1.0 / n_bins
+
+    # Map each non-empty bin's accuracy onto its bin index by matching lower edge
+    accs_by_bin = np.zeros(n_bins)
+    tol = width / 2  # tolerance for float comparison when matching edges
+    for lower, upper, acc, conf, frac in bin_data:
+        idx = int(np.argmin(np.abs(bin_lowers - lower)))
+        if abs(bin_lowers[idx] - lower) < tol:
+            accs_by_bin[idx] = acc
+
+    ax.bar(bin_lowers, accs_by_bin, width=width, align="edge", edgecolor="black",
+           color="#4C72B0", label="Model accuracy")
     ax.plot([0, 1], [0, 1], linestyle="--", color="gray", label="Perfect calibration")
     ax.set_xlabel("Confidence")
     ax.set_ylabel("Accuracy")
