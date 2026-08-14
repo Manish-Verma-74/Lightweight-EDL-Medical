@@ -92,7 +92,9 @@ def evaluate(model, loader, device, loss_fn):
 
     all_pred, all_label = np.array(all_pred), np.array(all_label)
     accuracy = float(np.mean(all_pred == all_label))
+    avg_confidence = float(np.mean(all_conf))
     ece, _ = compute_ece(all_conf, all_pred, all_label, n_bins=15)
+    print(f"    (avg confidence={avg_confidence:.4f} vs accuracy={accuracy:.4f})")
     return accuracy, ece
 
 
