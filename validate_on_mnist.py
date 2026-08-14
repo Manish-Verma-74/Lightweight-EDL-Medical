@@ -22,10 +22,21 @@ thesis experiments -- MNIST + these specific backbones is just a fast,
 reliable way to confirm the loss and metric code behave correctly on real
 (not synthetic) training data before trusting them on the real medical task.
 
-Usage:
-    PYTHONPATH=. python validate_on_mnist.py --backbone efficientnet_b0 --epochs 3
+CHECKPOINTING: after every epoch, we save (model, optimizer, epoch) to
+--checkpoint_dir, separately for each loss function. If a checkpoint already
+exists there when the script starts, we resume from the next epoch instead
+of retraining from scratch. Point --checkpoint_dir at a Google Drive path
+(e.g. /content/drive/MyDrive/Lightweight-EDL-Medical/checkpoints) so progress
+survives a Colab runtime disconnect, not just a browser hiccup.
+
+Usage (fresh run):
+    PYTHONPATH=. python validate_on_mnist.py --backbone efficientnet_b0 --epochs 10 \
+        --annealing_step 10 --checkpoint_dir /content/drive/MyDrive/Lightweight-EDL-Medical/checkpoints
+
+Usage (resuming): run the exact same command again -- it auto-detects and resumes.
 """
 import argparse
+import os
 import time
 
 import numpy as np
@@ -50,11 +61,40 @@ def parse_args():
     p.add_argument("--debug_subset", type=int, default=None,
                     help="If set, use only N train / N test samples (fast dry run)")
     p.add_argument("--data_root", default="data/mnist")
+    p.add_argument("--checkpoint_dir", default="checkpoints_mnist_validation",
+                    help="Where to save/resume per-epoch checkpoints. Point this at a "
+                         "Google Drive path in Colab so it survives runtime disconnects.")
     return p.parse_args()
 
 
-def train_one_model(model, loader, optimizer, loss_fn, epochs, device, num_classes, annealing_step):
-    for epoch in range(1, epochs + 1):
+def checkpoint_path(checkpoint_dir, backbone, loss_fn):
+    return os.path.join(checkpoint_dir, f"{backbone}_{loss_fn}.pt")
+
+
+def save_checkpoint(path, model, optimizer, epoch):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    torch.save({
+        "epoch": epoch,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+    }, path)
+
+
+def load_checkpoint_if_exists(path, model, optimizer, device):
+    """Returns the epoch to resume FROM (i.e. next epoch to run), or 1 if no checkpoint."""
+    if os.path.exists(path):
+        ckpt = torch.load(path, map_location=device)
+        model.load_state_dict(ckpt["model_state_dict"])
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        resume_epoch = ckpt["epoch"] + 1
+        print(f"  Found checkpoint at {path} -- resuming from epoch {resume_epoch}")
+        return resume_epoch
+    return 1
+
+
+def train_one_model(model, loader, optimizer, loss_fn, start_epoch, total_epochs, device,
+                     num_classes, annealing_step, ckpt_path):
+    for epoch in range(start_epoch, total_epochs + 1):
         model.train()
         running_loss = 0.0
         start = time.time()
@@ -71,7 +111,10 @@ def train_one_model(model, loader, optimizer, loss_fn, epochs, device, num_class
             optimizer.step()
             running_loss += loss.item() * images.size(0)
         avg_loss = running_loss / len(loader.dataset)
-        print(f"  [{loss_fn}] epoch {epoch}/{epochs} | loss={avg_loss:.4f} | {time.time()-start:.1f}s")
+        print(f"  [{loss_fn}] epoch {epoch}/{total_epochs} | loss={avg_loss:.4f} | {time.time()-start:.1f}s")
+
+        save_checkpoint(ckpt_path, model, optimizer, epoch)
+        print(f"    checkpoint saved -> {ckpt_path}")
 
 
 def evaluate(model, loader, device, loss_fn):
@@ -116,10 +159,19 @@ def main():
     results = {}
     for loss_fn in ["edl", "softmax"]:
         print(f"\n=== Training {args.backbone} with {loss_fn} loss ===")
+        ckpt_path = checkpoint_path(args.checkpoint_dir, args.backbone, loss_fn)
+
         model = get_backbone(args.backbone, num_classes=num_classes, pretrained=True).to(device)
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
-        train_one_model(model, train_loader, optimizer, loss_fn, args.epochs, device,
-                         num_classes, args.annealing_step)
+
+        start_epoch = load_checkpoint_if_exists(ckpt_path, model, optimizer, device)
+
+        if start_epoch > args.epochs:
+            print(f"  Checkpoint already reached epoch {start_epoch - 1} >= requested {args.epochs}, skipping training.")
+        else:
+            train_one_model(model, train_loader, optimizer, loss_fn, start_epoch, args.epochs,
+                             device, num_classes, args.annealing_step, ckpt_path)
+
         accuracy, ece = evaluate(model, test_loader, device, loss_fn)
         results[loss_fn] = (accuracy, ece)
         print(f"  -> test accuracy={accuracy:.4f} | test ECE={ece:.4f}")
