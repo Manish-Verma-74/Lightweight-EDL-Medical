@@ -59,13 +59,16 @@ def plot_reliability_diagram(bin_data, n_bins: int, save_path: str = None, title
     bin_lowers = bin_edges[:-1]
     width = 1.0 / n_bins
 
-    # Map each non-empty bin's accuracy onto its bin index by matching lower edge
+    # Map each non-empty bin's accuracy onto its bin index directly, since bin_data's
+    # lower edges come from the same np.linspace used to build bin_edges here.
     accs_by_bin = np.zeros(n_bins)
-    tol = width / 2  # tolerance for float comparison when matching edges
     for lower, upper, acc, conf, frac in bin_data:
-        idx = int(np.argmin(np.abs(bin_lowers - lower)))
-        if abs(bin_lowers[idx] - lower) < tol:
-            accs_by_bin[idx] = acc
+        # Find which confidence interval this lower edge belongs to.
+        # searchsorted(..., side="right") returns the insertion point
+        # after an equal edge, so subtract 1 to recover the interval index.
+        idx = np.searchsorted(bin_edges, lower, side="right") - 1
+        idx = min(max(idx, 0), n_bins - 1)
+        accs_by_bin[idx] = acc
 
     ax.bar(bin_lowers, accs_by_bin, width=width, align="edge", edgecolor="black",
            color="#4C72B0", label="Model accuracy")
