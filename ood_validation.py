@@ -120,7 +120,8 @@ def main():
     sm_drop = results["softmax"]["conf_drop"]
     print("\nSanity check:")
     print(f"  - EDL's confidence drop on OOD data is larger than softmax's "
-          f"(this is the actual claim in Sensoy et al. 2018): "
+          f"(EDL is expected to reduce confidence on OOD inputs compared with "
+          f"standard softmax classifiers): "
           f"{'PASS' if edl_drop > sm_drop else 'CHECK -- EDL does not show a larger OOD confidence drop than softmax'}")
 
 
