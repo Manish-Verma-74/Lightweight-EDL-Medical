@@ -708,11 +708,6 @@ def main():
         val_indices,
     )
 
-    print(
-        f"Train samples: {len(train_subset)} "
-        f"| Val samples: {len(val_subset)}"
-    )
-
     # ========================================================
     # Class balancing
     # ========================================================
@@ -746,6 +741,12 @@ def main():
             sample_weights
         ),
         replacement=True,
+    )
+
+    print(
+        f"Train samples: {len(train_subset)} "
+        f"| Val samples: {len(val_subset)} "
+        f"| Sampler: {type(sampler).__name__}"
     )
 
     # ========================================================
