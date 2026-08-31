@@ -805,6 +805,7 @@ def main():
         args.loss_fn,
         args.augmentation,
         args.seed,
+        args.debug_subset,
     )
 
     best_path = best_checkpoint_path(
