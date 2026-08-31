@@ -44,9 +44,11 @@ import random
 import time
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Subset
+from sklearn.model_selection import StratifiedGroupKFold
 
 from datasets.ham10000 import (
     HAM10000Dataset,
@@ -614,7 +616,7 @@ def main():
         CLASS_NAMES
     )
 
-    # --------------------------------------------------------
+        # --------------------------------------------------------
     # Load training dataset
     # --------------------------------------------------------
 
@@ -637,23 +639,83 @@ def main():
     )
 
     # --------------------------------------------------------
-    # Train / validation split
+    # Lesion-level, class-stratified train / validation split
     # --------------------------------------------------------
 
     n = len(
         full_dataset
     )
 
-    indices = list(
-        range(n)
+    all_indices = np.arange(n)
+
+    all_labels = np.array(
+        full_dataset.labels
     )
 
-    random.shuffle(
-        indices
+    all_lesion_ids = (
+        full_dataset.metadata["lesion_id"].values
+    )
+
+    # Approximately (1 / val_split) folds; one fold held out as validation.
+    # val_split=0.15 -> n_splits=7 -> ~14.3% held out.
+    n_splits = round(1 / args.val_split)
+
+    sgkf = StratifiedGroupKFold(
+        n_splits=n_splits,
+        shuffle=True,
+        random_state=args.seed,
+    )
+
+    train_indices, val_indices = next(
+        sgkf.split(
+            all_indices,
+            all_labels,
+            groups=all_lesion_ids,
+        )
     )
 
     # --------------------------------------------------------
-    # Debug subset
+    # Sanity check: confirm zero lesion leakage between splits
+    # --------------------------------------------------------
+
+    train_lesions = set(
+        all_lesion_ids[train_indices]
+    )
+
+    val_lesions = set(
+        all_lesion_ids[val_indices]
+    )
+
+    overlap = train_lesions & val_lesions
+
+    print(
+        f"Lesion overlap between train/val: {len(overlap)} (should be 0)"
+    )
+
+    if len(overlap) != 0:
+        raise RuntimeError(
+            f"Lesion leakage detected: {len(overlap)} lesion(s) appear in "
+            f"both train and validation splits. Aborting."
+        )
+
+    # --------------------------------------------------------
+    # Class distribution check (diagnostic only)
+    # --------------------------------------------------------
+
+    print(
+        "Train class distribution:",
+        pd.Series(all_labels[train_indices]).value_counts().sort_index().to_dict(),
+    )
+
+    print(
+        "Validation class distribution:",
+        pd.Series(all_labels[val_indices]).value_counts().sort_index().to_dict(),
+    )
+
+    # --------------------------------------------------------
+    # Debug subset (applied AFTER the lesion-safe split, only
+    # to the training set, so debug runs still respect lesion
+    # grouping on whatever subset they touch)
     # --------------------------------------------------------
 
     if args.debug_subset is not None:
@@ -664,43 +726,7 @@ def main():
                 "--debug_subset must be greater than 0."
             )
 
-        indices = indices[
-            :args.debug_subset
-        ]
-
-        n = len(
-            indices
-        )
-
-    # --------------------------------------------------------
-    # Validation size
-    # --------------------------------------------------------
-
-    n_val = max(
-        1,
-        int(
-            n * args.val_split
-        ),
-    )
-
-    if n_val >= n:
-
-        raise ValueError(
-            "Validation split leaves no training samples. "
-            "Increase dataset size or decrease --val_split."
-        )
-
-    # --------------------------------------------------------
-    # Indices
-    # --------------------------------------------------------
-
-    val_indices = indices[
-        :n_val
-    ]
-
-    train_indices = indices[
-        n_val:
-    ]
+        train_indices = train_indices[:args.debug_subset]
 
     # --------------------------------------------------------
     # Dataset subsets
@@ -754,7 +780,8 @@ def main():
     print(
         f"Train samples: {len(train_subset)} "
         f"| Val samples: {len(val_subset)} "
-        f"| Sampler: {type(sampler).__name__}"
+        f"| Sampler: {type(sampler).__name__} "
+        f"| Lesion-level split, n_splits={n_splits}"
     )
 
     # ========================================================
