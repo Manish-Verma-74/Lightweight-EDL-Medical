@@ -203,20 +203,28 @@ def checkpoint_path(
     loss_fn,
     augmentation,
     seed,
+    debug_subset=None,
 ):
     """
     Generate a unique checkpoint filename for each experiment.
 
     Example:
         ham10000_efficientnet_b0_edl_standard_seed42.pt
+
+    Debug/sanity-check runs get a distinguishing suffix so they
+    never collide with a real full-dataset run of the same config:
+        ham10000_efficientnet_b0_edl_standard_seed42_debug200.pt
     """
+
+    debug_suffix = f"_debug{debug_subset}" if debug_subset else ""
 
     fname = (
         f"{dataset}_"
         f"{backbone}_"
         f"{loss_fn}_"
         f"{augmentation}_"
-        f"seed{seed}.pt"
+        f"seed{seed}"
+        f"{debug_suffix}.pt"
     )
 
     return os.path.join(
