@@ -1,25 +1,28 @@
 """
-Check calibration of the trained HAM10000 models (Task #1 EDL, Task #2 softmax).
+Check calibration of the trained HAM10000 models using the
+LESION-LEVEL corrected split (Task #1 EDL, Task #2 softmax).
 
 Loads:
-    1. EfficientNet-B0 + EDL checkpoint (ham10000_efficientnet_b0_edl_standard_seed42_best.pt)
-    2. EfficientNet-B0 + Softmax checkpoint (ham10000_efficientnet_b0_softmax_standard_seed42_best.pt)
+    1. EfficientNet-B0 + EDL checkpoint   (..._edl_standard_lesion_seed42_best.pt)
+    2. EfficientNet-B0 + Softmax checkpoint (..._softmax_standard_lesion_seed42_best.pt)
 
-Evaluates on the SAME validation split used during training (same seed, same
-val_split ratio) so the reported ECE matches what was logged in master_log.csv.
+Evaluates on the SAME lesion-grouped validation split used during training
+(same seed, same StratifiedGroupKFold config), so results are directly
+comparable between models and consistent with what train.py logged.
 
 This script DOES NOT train the models again.
 """
 
 import argparse
 import os
-import random
 
 import numpy as np
+import pandas as pd
 import torch
+from sklearn.model_selection import StratifiedGroupKFold
 from torch.utils.data import DataLoader, Subset
 
-from datasets.ham10000 import HAM10000Dataset, default_transforms  
+from datasets.ham10000 import HAM10000Dataset, default_transforms
 from losses.evidential_loss import edl_predictions
 from metrics.ece import compute_ece, plot_reliability_diagram
 from models.backbone_factory import get_backbone
@@ -33,7 +36,7 @@ def parse_args():
     p.add_argument("--backbone", default="efficientnet_b0",
                     choices=["efficientnet_b0", "mobilenet_v3_small", "shufflenet_v2"])
     p.add_argument("--dataset", default="ham10000")
-    p.add_argument("--augmentation", default="standard")
+    p.add_argument("--augmentation", default="standard_lesion")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--val_split", type=float, default=0.15)
     p.add_argument("--batch_size", type=int, default=64)
@@ -46,24 +49,24 @@ def parse_args():
 
 
 def build_val_loader(args):
-    """Rebuild the exact same validation split train.py used, via the same seed."""
-    random.seed(args.seed)
-
+    """Rebuild the exact same lesion-grouped validation split train.py used."""
     val_dataset_raw = HAM10000Dataset(
         args.data_root,
         transform=default_transforms(train=False),
     )
 
     n = len(val_dataset_raw)
-    indices = list(range(n))
-    random.shuffle(indices)
+    all_indices = np.arange(n)
+    all_labels = np.array(val_dataset_raw.labels)
+    all_lesion_ids = val_dataset_raw.metadata["lesion_id"].values
 
-    n_val = max(1, int(n * args.val_split))
-    val_indices = indices[:n_val]
+    n_splits = round(1 / args.val_split)
+    sgkf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=args.seed)
+    _, val_indices = next(sgkf.split(all_indices, all_labels, groups=all_lesion_ids))
 
     val_subset = Subset(val_dataset_raw, val_indices)
-    print(f"Rebuilt validation split: {len(val_subset)} samples "
-          f"(seed={args.seed}, val_split={args.val_split})")
+    print(f"Rebuilt lesion-level validation split: {len(val_subset)} samples "
+          f"(seed={args.seed}, n_splits={n_splits})")
 
     return DataLoader(val_subset, batch_size=args.batch_size, shuffle=False, num_workers=2)
 
@@ -103,10 +106,11 @@ def main():
 
     val_loader = build_val_loader(args)
 
-    for loss_fn in ["edl", "softmax"]:
-        print(f"\n=== Reliability diagram: {args.backbone} ({loss_fn}) ===")
+    results_summary = []
 
-        # Use the BEST checkpoint (peak val accuracy epoch), not latest
+    for loss_fn in ["edl", "softmax"]:
+        print(f"\n=== Reliability diagram: {args.backbone} ({loss_fn}, lesion-level) ===")
+
         ckpt_path = checkpoint_path(
             args.checkpoint_dir, args.dataset, args.backbone,
             loss_fn, args.augmentation, args.seed,
@@ -125,14 +129,22 @@ def main():
         print(f"  Direction of miscalibration: {direction} "
               f"(avg confidence {avg_confidence:.4f} vs accuracy {accuracy:.4f})")
 
+        results_summary.append((loss_fn, accuracy, avg_confidence, ece, direction))
+
         save_path = os.path.join(
-            args.output_dir, f"ham10000_{args.backbone}_{loss_fn}_reliability.png"
+            args.output_dir, f"ham10000_{args.backbone}_{loss_fn}_lesion_reliability.png"
         )
         plot_reliability_diagram(
             bin_data, n_bins=args.n_bins, save_path=save_path,
-            title=f"HAM10000 {args.backbone} -- {loss_fn} (ECE={ece:.4f}, {direction})"
+            title=f"HAM10000 (lesion-level) {args.backbone} -- {loss_fn} "
+                  f"(ECE={ece:.4f}, {direction})"
         )
         print(f"  Saved reliability diagram -> {save_path}")
+
+    print("\n=== Summary (best-checkpoint, lesion-level split, consistent evaluation) ===")
+    for loss_fn, acc, conf, ece, direction in results_summary:
+        print(f"  {loss_fn:8s} | accuracy={acc:.4f} | avg_confidence={conf:.4f} "
+              f"| ECE={ece:.4f} | {direction}")
 
     print("\nDone. Compare the two saved PNGs.")
 
