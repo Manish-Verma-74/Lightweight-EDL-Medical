@@ -96,3 +96,77 @@ def edl_predictions(output: torch.Tensor):
     confidence, pred_class = torch.max(prob, dim=1)
     uncertainty = (num_classes / S).squeeze(1)
     return pred_class, confidence, uncertainty
+
+
+def redl_loss(
+    output: torch.Tensor,
+    target: torch.Tensor,
+    epoch_num: int,
+    num_classes: int,
+    annealing_step: int,
+    device: torch.device,
+    lam: float = 0.1,
+) -> torch.Tensor:
+    """
+    R-EDL loss based on Chen, Gao, and Xu, ICLR 2024,
+    "R-EDL: Relaxing Nonessential Settings of Evidential Deep Learning."
+    Paper: https://proceedings.iclr.cc/paper_files/paper/2024/file/98f8c89ae042c512e6c87e0e0c2a0f98-Paper-Conference.pdf
+    Code:  https://github.com/MengyuanChen21/ICLR2024-REDL
+
+    R-EDL makes two principal changes to Standard EDL:
+    1. Generalized prior weight: alpha = evidence + lambda
+       instead of the fixed: alpha = evidence + 1
+    2. Removes the variance-minimizing term from the standard Dirichlet
+       MSE objective and directly minimizes the squared error between
+       the projected Dirichlet mean P = alpha / S and the one-hot target.
+    The KL regularization term is retained.
+
+    Experimental-control decisions in this implementation (not part of
+    the R-EDL method itself -- see thesis methods section):
+    - ReLU is retained as the evidence activation to match our existing
+      Standard EDL implementation. The original R-EDL experiments use
+      Softplus.
+    - The KL annealing schedule is retained from our Standard EDL
+      implementation because the R-EDL paper does not specify this
+      schedule explicitly. This keeps the comparison controlled.
+    """
+    evidence = relu_evidence(output)
+    alpha = evidence + lam                        # Eq. 9: generalized alpha
+    S = torch.sum(alpha, dim=1, keepdim=True)
+    P = alpha / S                                  # projected probability
+
+    target_onehot = F.one_hot(target, num_classes).float().to(device)
+
+    # Direct squared error on projected probability.
+    # IMPORTANT: R-EDL removes the variance-minimizing term.
+    L_redl = torch.sum((target_onehot - P) ** 2, dim=1, keepdim=True)
+
+    annealing_coef = min(1.0, float(epoch_num) / float(max(1, annealing_step)))
+
+    # KL regularization: target class -> 1, non-target classes -> alpha
+    alpha_tilde = alpha * (1 - target_onehot) + target_onehot
+    C = annealing_coef * kl_divergence(alpha_tilde, num_classes, device)
+
+    return torch.mean(L_redl + C)
+
+
+def redl_predictions(output: torch.Tensor, lam: float = 0.1):
+    """
+    R-EDL prediction and uncertainty.
+
+    Uncertainty follows the CORRECTION reported by the authors in the
+    official R-EDL repository README (not the paper PDF, which omits
+    lambda in the equation below Eq. 9):
+        u = lambda * K / S
+    Treat this as a repository-derived implementation detail, not
+    simply "the R-EDL uncertainty formula" from the published paper.
+    """
+    evidence = relu_evidence(output)
+    alpha = evidence + lam
+    S = torch.sum(alpha, dim=1, keepdim=True)
+    prob = alpha / S
+    num_classes = output.shape[1]
+
+    confidence, pred_class = torch.max(prob, dim=1)
+    uncertainty = (lam * num_classes / S).squeeze(1)   # authors' correction
+    return pred_class, confidence, uncertainty
