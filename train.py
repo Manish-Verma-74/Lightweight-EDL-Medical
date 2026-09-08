@@ -1,40 +1,41 @@
 """
-Train an EDL-head or softmax backbone on HAM10000.
+Train an EDL-head, R-EDL-head, or softmax backbone on HAM10000.
 
-Checkpoint strategy
--------------------
-Every experiment permutation gets its own checkpoint identity:
+Supported loss functions:
+    - edl
+    - redl
+    - softmax
 
-    {dataset}_{backbone}_{loss_fn}_{augmentation}_seed{seed}.pt
+R-EDL:
+    Chen, Gao, Xu, ICLR 2024
+    "R-EDL: Relaxing Nonessential Settings of Evidential Deep Learning"
 
-Two checkpoint files are maintained:
+Experiment design:
+    - HAM10000
+    - Lesion-level StratifiedGroupKFold split
+    - WeightedRandomSampler for class imbalance
+    - EfficientNet-B0 / MobileNetV3-Small / ShuffleNetV2
+    - Standard augmentation currently handled by datasets.ham10000
+    - Accuracy + ECE
+    - Best checkpoint selected using validation accuracy
 
-1. Latest/recovery checkpoint:
-       ..._seed42.pt
-
-   Overwritten every epoch.
-   Used to resume training after a Colab disconnect.
-
-2. Best checkpoint:
-       ..._seed42_best.pt
-
-   Saved only when validation accuracy improves.
-   Always contains the actual best-performing model weights.
-
-The full experiment configuration is stored inside both checkpoint files.
-
-Example:
+Example R-EDL run:
 
     python train.py \
         --backbone efficientnet_b0 \
-        --loss_fn edl \
+        --loss_fn redl \
+        --redl_lambda 0.1 \
         --dataset ham10000 \
         --augmentation standard \
         --seed 42 \
         --data_root data/ham10000 \
-        --epochs 20 \
-        --checkpoint_dir /content/drive/MyDrive/Lightweight-EDL-Medical/checkpoints \
-        --log_path /content/drive/MyDrive/Lightweight-EDL-Medical/results/master_log.csv
+        --epochs 30 \
+        --batch_size 32 \
+        --lr 1e-4 \
+        --annealing_step 10 \
+        --patience 5 \
+        --checkpoint_dir checkpoints \
+        --log_path results/framework_screening.csv
 """
 
 import argparse
@@ -47,6 +48,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+
 from torch.utils.data import DataLoader, Subset
 from sklearn.model_selection import StratifiedGroupKFold
 
@@ -59,6 +61,8 @@ from datasets.ham10000 import (
 from losses.evidential_loss import (
     edl_mse_loss,
     edl_predictions,
+    redl_loss,
+    redl_predictions,
 )
 
 from metrics.ece import compute_ece
@@ -72,8 +76,10 @@ from models.backbone_factory import get_backbone
 
 def set_seed(seed: int):
     """Set random seeds for reproducible experiments."""
+
     random.seed(seed)
     np.random.seed(seed)
+
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
@@ -83,9 +89,14 @@ def set_seed(seed: int):
 # ============================================================
 
 def parse_args():
+
     p = argparse.ArgumentParser(
-        description="Train EDL or Softmax model on HAM10000."
+        description="Train EDL, R-EDL, or Softmax model on HAM10000."
     )
+
+    # --------------------------------------------------------
+    # Backbone
+    # --------------------------------------------------------
 
     p.add_argument(
         "--backbone",
@@ -97,16 +108,32 @@ def parse_args():
         ],
     )
 
+    # --------------------------------------------------------
+    # Loss function
+    # --------------------------------------------------------
+
     p.add_argument(
         "--loss_fn",
         default="edl",
-        choices=["edl", "softmax"],
+        choices=[
+            "edl",
+            "redl",
+            "softmax",
+        ],
     )
+
+    # --------------------------------------------------------
+    # Dataset
+    # --------------------------------------------------------
 
     p.add_argument(
         "--dataset",
         default="ham10000",
     )
+
+    # --------------------------------------------------------
+    # Augmentation label
+    # --------------------------------------------------------
 
     p.add_argument(
         "--augmentation",
@@ -114,15 +141,23 @@ def parse_args():
         help=(
             "Label for the augmentation strategy used "
             "(e.g. standard, mixup, cutmix, randaugment). "
-            "Actual augmentation logic should be implemented "
+            "Actual augmentation logic is implemented "
             "in datasets/*.py."
         ),
     )
+
+    # --------------------------------------------------------
+    # Dataset root
+    # --------------------------------------------------------
 
     p.add_argument(
         "--data_root",
         default="data/ham10000",
     )
+
+    # --------------------------------------------------------
+    # Training parameters
+    # --------------------------------------------------------
 
     p.add_argument(
         "--epochs",
@@ -148,17 +183,43 @@ def parse_args():
         default=10,
     )
 
+    # --------------------------------------------------------
+    # R-EDL lambda
+    # --------------------------------------------------------
+
+    p.add_argument(
+        "--redl_lambda",
+        type=float,
+        default=0.1,
+        help=(
+            "Prior weight hyperparameter for R-EDL. "
+            "Used only when --loss_fn redl."
+        ),
+    )
+
+    # --------------------------------------------------------
+    # Reproducibility
+    # --------------------------------------------------------
+
     p.add_argument(
         "--seed",
         type=int,
         default=42,
     )
 
+    # --------------------------------------------------------
+    # Validation split
+    # --------------------------------------------------------
+
     p.add_argument(
         "--val_split",
         type=float,
         default=0.15,
     )
+
+    # --------------------------------------------------------
+    # Debug subset
+    # --------------------------------------------------------
 
     p.add_argument(
         "--debug_subset",
@@ -170,6 +231,10 @@ def parse_args():
         ),
     )
 
+    # --------------------------------------------------------
+    # Early stopping
+    # --------------------------------------------------------
+
     p.add_argument(
         "--patience",
         type=int,
@@ -177,14 +242,19 @@ def parse_args():
         help="Early stopping patience.",
     )
 
+    # --------------------------------------------------------
+    # Checkpoints
+    # --------------------------------------------------------
+
     p.add_argument(
         "--checkpoint_dir",
         default="checkpoints",
-        help=(
-            "Directory where experiment checkpoints are stored. "
-            "Use a Google Drive path in Colab."
-        ),
+        help="Directory where experiment checkpoints are stored.",
     )
+
+    # --------------------------------------------------------
+    # Results log
+    # --------------------------------------------------------
 
     p.add_argument(
         "--log_path",
@@ -206,19 +276,35 @@ def checkpoint_path(
     augmentation,
     seed,
     debug_subset=None,
+    redl_lambda=0.1,
 ):
     """
-    Generate a unique checkpoint filename for each experiment.
+    Generate a unique checkpoint filename.
 
-    Example:
+    Standard EDL / Softmax:
+
         ham10000_efficientnet_b0_edl_standard_seed42.pt
 
-    Debug/sanity-check runs get a distinguishing suffix so they
-    never collide with a real full-dataset run of the same config:
-        ham10000_efficientnet_b0_edl_standard_seed42_debug200.pt
+    R-EDL:
+
+        ham10000_efficientnet_b0_redl_standard_seed42_lam0.1.pt
+
+    Debug run:
+
+        ham10000_efficientnet_b0_redl_standard_seed42_lam0.1_debug50.pt
     """
 
-    debug_suffix = f"_debug{debug_subset}" if debug_subset else ""
+    debug_suffix = (
+        f"_debug{debug_subset}"
+        if debug_subset is not None
+        else ""
+    )
+
+    lambda_suffix = (
+        f"_lam{redl_lambda:g}"
+        if loss_fn == "redl"
+        else ""
+    )
 
     fname = (
         f"{dataset}_"
@@ -226,6 +312,7 @@ def checkpoint_path(
         f"{loss_fn}_"
         f"{augmentation}_"
         f"seed{seed}"
+        f"{lambda_suffix}"
         f"{debug_suffix}.pt"
     )
 
@@ -237,24 +324,12 @@ def checkpoint_path(
 
 def best_checkpoint_path(ckpt_path):
     """
-    Given the regular latest/recovery checkpoint path,
-    return the matching '_best' checkpoint path.
-
-    Example:
-
-        ham10000_efficientnet_b0_edl_standard_seed42.pt
-
-    becomes:
-
-        ham10000_efficientnet_b0_edl_standard_seed42_best.pt
-
-    The regular checkpoint contains the latest epoch.
-
-    The best checkpoint contains the actual model weights
-    from the epoch with the best validation accuracy.
+    Convert latest checkpoint path into best checkpoint path.
     """
 
-    root, ext = os.path.splitext(ckpt_path)
+    root, ext = os.path.splitext(
+        ckpt_path
+    )
 
     return f"{root}_best{ext}"
 
@@ -273,8 +348,13 @@ def save_checkpoint(
     best_epoch,
 ):
     """
-    Save model weights, optimizer state, experiment configuration,
-    and best-validation-result tracking.
+    Save:
+
+        - model state
+        - optimizer state
+        - experiment configuration
+        - hyperparameters
+        - best validation information
     """
 
     directory = os.path.dirname(path)
@@ -290,42 +370,62 @@ def save_checkpoint(
             # ------------------------------------------------
             # Training state
             # ------------------------------------------------
+
             "epoch": epoch,
 
-            "model_state_dict": model.state_dict(),
+            "model_state_dict":
+                model.state_dict(),
 
-            "optimizer_state_dict": optimizer.state_dict(),
+            "optimizer_state_dict":
+                optimizer.state_dict(),
 
             # ------------------------------------------------
             # Experiment identity
             # ------------------------------------------------
-            "dataset": args.dataset,
 
-            "backbone": args.backbone,
+            "dataset":
+                args.dataset,
 
-            "loss_fn": args.loss_fn,
+            "backbone":
+                args.backbone,
 
-            "augmentation": args.augmentation,
+            "loss_fn":
+                args.loss_fn,
 
-            "seed": args.seed,
+            "augmentation":
+                args.augmentation,
+
+            "seed":
+                args.seed,
 
             # ------------------------------------------------
             # Hyperparameters
             # ------------------------------------------------
-            "batch_size": args.batch_size,
 
-            "lr": args.lr,
+            "batch_size":
+                args.batch_size,
 
-            "annealing_step": args.annealing_step,
+            "lr":
+                args.lr,
 
-            "val_split": args.val_split,
+            "annealing_step":
+                args.annealing_step,
+
+            "redl_lambda":
+                args.redl_lambda,
+
+            "val_split":
+                args.val_split,
 
             # ------------------------------------------------
             # Best validation result
             # ------------------------------------------------
-            "best_metric": best_metric,
 
-            "best_epoch": best_epoch,
+            "best_metric":
+                best_metric,
+
+            "best_epoch":
+                best_epoch,
         },
         path,
     )
@@ -342,28 +442,22 @@ def load_checkpoint_if_exists(
     device,
 ):
     """
-    Resume training if a latest checkpoint exists.
+    Resume from latest checkpoint if available.
 
     Returns:
 
         resume_epoch
         best_metric
         best_epoch
-
-    If no checkpoint exists:
-
-        1
-        -1.0
-        0
-
-    The best validation information is restored from the
-    checkpoint so a Colab restart does not forget the previous
-    best epoch.
     """
 
     if not os.path.exists(path):
 
-        return 1, -1.0, 0
+        return (
+            1,
+            -1.0,
+            0,
+        )
 
     ckpt = torch.load(
         path,
@@ -387,10 +481,12 @@ def load_checkpoint_if_exists(
     )
 
     # --------------------------------------------------------
-    # Restore training information
+    # Restore tracking information
     # --------------------------------------------------------
 
-    resume_epoch = ckpt["epoch"] + 1
+    resume_epoch = (
+        ckpt["epoch"] + 1
+    )
 
     best_metric = ckpt.get(
         "best_metric",
@@ -419,6 +515,13 @@ def load_checkpoint_if_exists(
         f"seed{ckpt.get('seed', 'unknown')}"
     )
 
+    if ckpt.get("loss_fn") == "redl":
+
+        print(
+            f"Checkpoint R-EDL lambda: "
+            f"{ckpt.get('redl_lambda', 'unknown')}"
+        )
+
     print(
         f"Previous best validation accuracy: "
         f"{best_metric:.4f} "
@@ -442,9 +545,10 @@ def evaluate(
     device,
     num_classes,
     loss_fn,
+    redl_lambda=0.1,
 ):
     """
-    Evaluate the model using:
+    Evaluate model using:
 
         - Accuracy
         - ECE
@@ -461,22 +565,41 @@ def evaluate(
 
         for images, labels in loader:
 
-            images = images.to(device)
+            images = images.to(
+                device
+            )
 
-            output = model(images)
+            output = model(
+                images
+            )
 
             # ------------------------------------------------
-            # EDL prediction
+            # Standard EDL
             # ------------------------------------------------
 
             if loss_fn == "edl":
 
-                pred_class, confidence, _ = edl_predictions(
-                    output
+                pred_class, confidence, _ = (
+                    edl_predictions(
+                        output
+                    )
                 )
 
             # ------------------------------------------------
-            # Softmax prediction
+            # R-EDL
+            # ------------------------------------------------
+
+            elif loss_fn == "redl":
+
+                pred_class, confidence, _ = (
+                    redl_predictions(
+                        output,
+                        lam=redl_lambda,
+                    )
+                )
+
+            # ------------------------------------------------
+            # Softmax
             # ------------------------------------------------
 
             else:
@@ -486,9 +609,11 @@ def evaluate(
                     dim=1,
                 )
 
-                confidence, pred_class = torch.max(
-                    probs,
-                    dim=1,
+                confidence, pred_class = (
+                    torch.max(
+                        probs,
+                        dim=1,
+                    )
                 )
 
             all_conf.extend(
@@ -540,28 +665,146 @@ def evaluate(
 
 
 # ============================================================
+# CSV logging
+# ============================================================
+
+def write_log_row(
+    log_path,
+    log_row,
+):
+    """
+    Append an experiment result to CSV.
+
+    If an existing CSV has an incompatible header, a new file
+    with '_v2' suffix is created instead of corrupting the
+    previous results.
+    """
+
+    directory = os.path.dirname(
+        log_path
+    )
+
+    if directory:
+        os.makedirs(
+            directory,
+            exist_ok=True,
+        )
+
+    fieldnames = list(
+        log_row.keys()
+    )
+
+    actual_log_path = log_path
+
+    # --------------------------------------------------------
+    # Existing file
+    # --------------------------------------------------------
+
+    if os.path.exists(log_path):
+
+        with open(
+            log_path,
+            "r",
+            newline="",
+        ) as f:
+
+            reader = csv.reader(f)
+
+            try:
+                existing_header = next(
+                    reader
+                )
+            except StopIteration:
+                existing_header = []
+
+        # ----------------------------------------------------
+        # Compatible header
+        # ----------------------------------------------------
+
+        if existing_header == fieldnames:
+
+            write_header = False
+
+        # ----------------------------------------------------
+        # Incompatible header
+        # ----------------------------------------------------
+
+        else:
+
+            root, ext = os.path.splitext(
+                log_path
+            )
+
+            actual_log_path = (
+                f"{root}_v2{ext}"
+            )
+
+            print(
+                f"Existing CSV schema differs."
+            )
+
+            print(
+                f"Using new log file: "
+                f"{actual_log_path}"
+            )
+
+            write_header = not os.path.exists(
+                actual_log_path
+            )
+
+    else:
+
+        write_header = True
+
+    # --------------------------------------------------------
+    # Write
+    # --------------------------------------------------------
+
+    with open(
+        actual_log_path,
+        "a",
+        newline="",
+    ) as f:
+
+        writer = csv.DictWriter(
+            f,
+            fieldnames=fieldnames,
+        )
+
+        if write_header:
+
+            writer.writeheader()
+
+        writer.writerow(
+            log_row
+        )
+
+    return actual_log_path
+
+
+# ============================================================
 # Main training function
 # ============================================================
 
 def main():
 
-    # --------------------------------------------------------
+    # ========================================================
     # Arguments
-    # --------------------------------------------------------
+    # ========================================================
 
     args = parse_args()
 
-    # --------------------------------------------------------
+    # ========================================================
     # Reproducibility
-    # --------------------------------------------------------
+    # ========================================================
 
     set_seed(
         args.seed
     )
 
-    # --------------------------------------------------------
+    # ========================================================
     # Device
-    # --------------------------------------------------------
+    # ========================================================
 
     device = torch.device(
         "cuda"
@@ -573,6 +816,10 @@ def main():
         f"Using device: {device}"
     )
 
+    # ========================================================
+    # Experiment information
+    # ========================================================
+
     print(
         f"Experiment: "
         f"dataset={args.dataset} "
@@ -582,9 +829,16 @@ def main():
         f"seed={args.seed}"
     )
 
-    # --------------------------------------------------------
+    if args.loss_fn == "redl":
+
+        print(
+            f"R-EDL lambda: "
+            f"{args.redl_lambda}"
+        )
+
+    # ========================================================
     # Directories
-    # --------------------------------------------------------
+    # ========================================================
 
     os.makedirs(
         args.checkpoint_dir,
@@ -592,14 +846,15 @@ def main():
     )
 
     os.makedirs(
-        os.path.dirname(args.log_path)
-        or ".",
+        os.path.dirname(
+            args.log_path
+        ) or ".",
         exist_ok=True,
     )
 
-    # --------------------------------------------------------
+    # ========================================================
     # Dataset check
-    # --------------------------------------------------------
+    # ========================================================
 
     if args.dataset != "ham10000":
 
@@ -608,17 +863,17 @@ def main():
             "Add other datasets under datasets/."
         )
 
-    # --------------------------------------------------------
+    # ========================================================
     # Number of classes
-    # --------------------------------------------------------
+    # ========================================================
 
     num_classes = len(
         CLASS_NAMES
     )
 
-    # --------------------------------------------------------
+    # ========================================================
     # Load training dataset
-    # --------------------------------------------------------
+    # ========================================================
 
     full_dataset = HAM10000Dataset(
         args.data_root,
@@ -627,9 +882,9 @@ def main():
         ),
     )
 
-    # --------------------------------------------------------
+    # ========================================================
     # Load validation dataset
-    # --------------------------------------------------------
+    # ========================================================
 
     val_dataset_raw = HAM10000Dataset(
         args.data_root,
@@ -638,27 +893,35 @@ def main():
         ),
     )
 
-    # --------------------------------------------------------
-    # Lesion-level, class-stratified train / validation split
-    # --------------------------------------------------------
+    # ========================================================
+    # Lesion-level split
+    # ========================================================
 
     n = len(
         full_dataset
     )
 
-    all_indices = np.arange(n)
+    all_indices = np.arange(
+        n
+    )
 
     all_labels = np.array(
         full_dataset.labels
     )
 
     all_lesion_ids = (
-        full_dataset.metadata["lesion_id"].values
+        full_dataset.metadata[
+            "lesion_id"
+        ].values
     )
 
-    # Approximately (1 / val_split) folds; one fold held out as validation.
-    # val_split=0.15 -> n_splits=7 -> ~14.3% held out.
-    n_splits = round(1 / args.val_split)
+    # --------------------------------------------------------
+    # Approximately 15% validation
+    # --------------------------------------------------------
+
+    n_splits = round(
+        1 / args.val_split
+    )
 
     sgkf = StratifiedGroupKFold(
         n_splits=n_splits,
@@ -674,49 +937,72 @@ def main():
         )
     )
 
-    # --------------------------------------------------------
-    # Sanity check: confirm zero lesion leakage between splits
-    # --------------------------------------------------------
+    # ========================================================
+    # Leakage check
+    # ========================================================
 
     train_lesions = set(
-        all_lesion_ids[train_indices]
+        all_lesion_ids[
+            train_indices
+        ]
     )
 
     val_lesions = set(
-        all_lesion_ids[val_indices]
+        all_lesion_ids[
+            val_indices
+        ]
     )
 
-    overlap = train_lesions & val_lesions
+    overlap = (
+        train_lesions
+        &
+        val_lesions
+    )
 
     print(
-        f"Lesion overlap between train/val: {len(overlap)} (should be 0)"
+        f"Lesion overlap between train/val: "
+        f"{len(overlap)} (should be 0)"
     )
 
     if len(overlap) != 0:
+
         raise RuntimeError(
-            f"Lesion leakage detected: {len(overlap)} lesion(s) appear in "
-            f"both train and validation splits. Aborting."
+            f"Lesion leakage detected: "
+            f"{len(overlap)} lesion(s) appear "
+            f"in both train and validation splits."
         )
 
-    # --------------------------------------------------------
-    # Class distribution check (diagnostic only)
-    # --------------------------------------------------------
+    # ========================================================
+    # Class distribution
+    # ========================================================
 
     print(
         "Train class distribution:",
-        pd.Series(all_labels[train_indices]).value_counts().sort_index().to_dict(),
+        pd.Series(
+            all_labels[
+                train_indices
+            ]
+        )
+        .value_counts()
+        .sort_index()
+        .to_dict(),
     )
 
     print(
         "Validation class distribution:",
-        pd.Series(all_labels[val_indices]).value_counts().sort_index().to_dict(),
+        pd.Series(
+            all_labels[
+                val_indices
+            ]
+        )
+        .value_counts()
+        .sort_index()
+        .to_dict(),
     )
 
-    # --------------------------------------------------------
-    # Debug subset (applied AFTER the lesion-safe split, only
-    # to the training set, so debug runs still respect lesion
-    # grouping on whatever subset they touch)
-    # --------------------------------------------------------
+    # ========================================================
+    # Debug subset
+    # ========================================================
 
     if args.debug_subset is not None:
 
@@ -726,11 +1012,24 @@ def main():
                 "--debug_subset must be greater than 0."
             )
 
-        train_indices = train_indices[:args.debug_subset]
+        if args.debug_subset > len(
+            train_indices
+        ):
 
-    # --------------------------------------------------------
+            raise ValueError(
+                "--debug_subset cannot exceed "
+                "the number of training samples."
+            )
+
+        train_indices = (
+            train_indices[
+                :args.debug_subset
+            ]
+        )
+
+    # ========================================================
     # Dataset subsets
-    # --------------------------------------------------------
+    # ========================================================
 
     train_subset = Subset(
         full_dataset,
@@ -758,7 +1057,8 @@ def main():
 
     class_weights = (
         1.0
-        / np.maximum(
+        /
+        np.maximum(
             class_counts,
             1,
         )
@@ -769,19 +1069,25 @@ def main():
         for label in train_labels
     ]
 
-    sampler = torch.utils.data.WeightedRandomSampler(
-        sample_weights,
-        num_samples=len(
-            sample_weights
-        ),
-        replacement=True,
+    sampler = (
+        torch.utils.data.WeightedRandomSampler(
+            sample_weights,
+            num_samples=len(
+                sample_weights
+            ),
+            replacement=True,
+        )
     )
 
     print(
-        f"Train samples: {len(train_subset)} "
-        f"| Val samples: {len(val_subset)} "
-        f"| Sampler: {type(sampler).__name__} "
-        f"| Lesion-level split, n_splits={n_splits}"
+        f"Train samples: "
+        f"{len(train_subset)} "
+        f"| Val samples: "
+        f"{len(val_subset)} "
+        f"| Sampler: "
+        f"{type(sampler).__name__} "
+        f"| Lesion-level split, "
+        f"n_splits={n_splits}"
     )
 
     # ========================================================
@@ -833,6 +1139,7 @@ def main():
         args.augmentation,
         args.seed,
         args.debug_subset,
+        args.redl_lambda,
     )
 
     best_path = best_checkpoint_path(
@@ -840,11 +1147,13 @@ def main():
     )
 
     print(
-        f"Checkpoint path: {ckpt_path}"
+        f"Checkpoint path: "
+        f"{ckpt_path}"
     )
 
     print(
-        f"Best checkpoint path: {best_path}"
+        f"Best checkpoint path: "
+        f"{best_path}"
     )
 
     # ========================================================
@@ -862,9 +1171,9 @@ def main():
         device,
     )
 
-    # --------------------------------------------------------
-    # Early stopping counter
-    # --------------------------------------------------------
+    # ========================================================
+    # Early stopping
+    # ========================================================
 
     epochs_no_improve = 0
 
@@ -903,9 +1212,9 @@ def main():
                 images
             )
 
-            # ------------------------------------------------
-            # EDL loss
-            # ------------------------------------------------
+            # =================================================
+            # Standard EDL
+            # =================================================
 
             if args.loss_fn == "edl":
 
@@ -918,9 +1227,25 @@ def main():
                     device=device,
                 )
 
-            # ------------------------------------------------
-            # Softmax loss
-            # ------------------------------------------------
+            # =================================================
+            # R-EDL
+            # =================================================
+
+            elif args.loss_fn == "redl":
+
+                loss = redl_loss(
+                    output,
+                    labels,
+                    epoch_num=epoch,
+                    num_classes=num_classes,
+                    annealing_step=args.annealing_step,
+                    device=device,
+                    lam=args.redl_lambda,
+                )
+
+            # =================================================
+            # Softmax
+            # =================================================
 
             else:
 
@@ -939,21 +1264,23 @@ def main():
 
             running_loss += (
                 loss.item()
-                * images.size(0)
+                *
+                images.size(0)
             )
 
-        # ----------------------------------------------------
+        # ====================================================
         # Average training loss
-        # ----------------------------------------------------
+        # ====================================================
 
         train_loss = (
             running_loss
-            / len(train_subset)
+            /
+            len(train_subset)
         )
 
-        # ----------------------------------------------------
+        # ====================================================
         # Validation
-        # ----------------------------------------------------
+        # ====================================================
 
         val_acc, val_ece, _ = evaluate(
             model,
@@ -961,11 +1288,13 @@ def main():
             device,
             num_classes,
             args.loss_fn,
+            redl_lambda=args.redl_lambda,
         )
 
         elapsed = (
             time.time()
-            - epoch_start
+            -
+            epoch_start
         )
 
         print(
@@ -995,10 +1324,7 @@ def main():
             )
 
             # ------------------------------------------------
-            # Save actual BEST model
-            #
-            # This checkpoint is NOT overwritten on epochs
-            # where validation accuracy does not improve.
+            # Save BEST checkpoint
             # ------------------------------------------------
 
             save_checkpoint(
@@ -1021,10 +1347,7 @@ def main():
             epochs_no_improve += 1
 
         # ====================================================
-        # Save LATEST / RECOVERY checkpoint
-        #
-        # This is intentionally overwritten every epoch for
-        # THIS experiment permutation only.
+        # Save latest/recovery checkpoint
         # ====================================================
 
         save_checkpoint(
@@ -1057,6 +1380,46 @@ def main():
             break
 
     # ========================================================
+    # Reload BEST checkpoint
+    # ========================================================
+
+    if os.path.exists(
+        best_path
+    ):
+
+        print()
+        print(
+            f"Loading best checkpoint "
+            f"for final evaluation:"
+        )
+        print(
+            best_path
+        )
+
+        best_ckpt = torch.load(
+            best_path,
+            map_location=device,
+        )
+
+        model.load_state_dict(
+            best_ckpt[
+                "model_state_dict"
+            ]
+        )
+
+        print(
+            f"Best checkpoint epoch: "
+            f"{best_ckpt.get('epoch', 'unknown')}"
+        )
+
+    else:
+
+        print(
+            "WARNING: Best checkpoint not found. "
+            "Using current model for final evaluation."
+        )
+
+    # ========================================================
     # Final evaluation
     # ========================================================
 
@@ -1066,10 +1429,11 @@ def main():
         device,
         num_classes,
         args.loss_fn,
+        redl_lambda=args.redl_lambda,
     )
 
     # ========================================================
-    # CSV logging
+    # Run ID
     # ========================================================
 
     run_id = (
@@ -1080,81 +1444,90 @@ def main():
         f"seed{args.seed}"
     )
 
+    if args.loss_fn == "redl":
+
+        run_id += (
+            f"_lam{args.redl_lambda:g}"
+        )
+
+    # ========================================================
+    # CSV log row
+    # ========================================================
+
     log_row = {
 
-        "run_id": run_id,
+        "run_id":
+            run_id,
 
-        "dataset": args.dataset,
+        "dataset":
+            args.dataset,
 
-        "backbone": args.backbone,
+        "backbone":
+            args.backbone,
 
-        "loss_fn": args.loss_fn,
+        "loss_fn":
+            args.loss_fn,
 
-        "augmentation": args.augmentation,
+        "augmentation":
+            args.augmentation,
 
-        "seed": args.seed,
+        "seed":
+            args.seed,
 
-        "epochs": epoch,
+        "epochs":
+            epoch,
 
-        "batch_size": args.batch_size,
+        "batch_size":
+            args.batch_size,
 
-        "learning_rate": args.lr,
+        "learning_rate":
+            args.lr,
 
-        "annealing_step": args.annealing_step,
+        "annealing_step":
+            args.annealing_step,
 
-        "train_samples": len(
-            train_subset
-        ),
+        "redl_lambda":
+            args.redl_lambda,
 
-        "val_samples": len(
-            val_subset
-        ),
+        "train_samples":
+            len(train_subset),
 
-        "accuracy": final_acc,
+        "val_samples":
+            len(val_subset),
 
-        "ece": final_ece,
+        "accuracy":
+            final_acc,
 
-        "ood_auroc": "",
+        "ece":
+            final_ece,
 
-        "latency": "",
+        "ood_auroc":
+            "",
 
-        "best_epoch": best_epoch,
+        "latency":
+            "",
 
-        "best_val_accuracy": best_val_acc,
+        "best_epoch":
+            best_epoch,
 
-        "checkpoint_path": ckpt_path,
+        "best_val_accuracy":
+            best_val_acc,
 
-        "best_checkpoint_path": best_path,
+        "checkpoint_path":
+            ckpt_path,
+
+        "best_checkpoint_path":
+            best_path,
     }
 
     # ========================================================
     # Write CSV
     # ========================================================
 
-    write_header = not os.path.exists(
-        args.log_path
-    )
-
-    with open(
+    actual_log_path = write_log_row(
         args.log_path,
-        "a",
-        newline="",
-    ) as f:
-
-        writer = csv.DictWriter(
-            f,
-            fieldnames=list(
-                log_row.keys()
-            ),
-        )
-
-        if write_header:
-
-            writer.writeheader()
-
-        writer.writerow(
-            log_row
-        )
+        log_row,
+    )
 
     # ========================================================
     # Final summary
@@ -1173,6 +1546,18 @@ def main():
     print(
         "=" * 60
     )
+
+    print(
+        f"Loss function            : "
+        f"{args.loss_fn}"
+    )
+
+    if args.loss_fn == "redl":
+
+        print(
+            f"R-EDL lambda             : "
+            f"{args.redl_lambda}"
+        )
 
     print(
         f"Best validation accuracy : "
@@ -1196,7 +1581,7 @@ def main():
 
     print(
         f"Results logged to        : "
-        f"{args.log_path}"
+        f"{actual_log_path}"
     )
 
     print(
