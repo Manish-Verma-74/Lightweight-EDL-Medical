@@ -507,7 +507,6 @@ def main():
         "batch_size": args.batch_size,
         "learning_rate": args.lr,
         "annealing_step": args.annealing_step,
-        "redl_lambda": args.redl_lambda,
         "train_samples": len(train_subset),
         "val_samples": len(val_subset),
         "accuracy": final_acc,
