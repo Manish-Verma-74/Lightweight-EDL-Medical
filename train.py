@@ -1,41 +1,40 @@
 """
-Train an EDL-head, R-EDL-head, F-EDL-head, or softmax backbone on HAM10000.
+Train an EDL, R-EDL, F-EDL, or Softmax lightweight backbone on HAM10000.
 
-Supported loss functions:
-    - edl
-    - redl
-    - softmax
+Google Drive Persistent Storage Architecture:
+    /content/drive/MyDrive/Lightweight-EDL-Medical/
+    ├── checkpoints/
+    ├── results/
+    │   └── master_log.csv
+    └── data/
+        └── ham10000/
 
-R-EDL:
-    Chen, Gao, Xu, ICLR 2024
-    "R-EDL: Relaxing Nonessential Settings of Evidential Deep Learning"
+Supported Loss Functions:
+    - edl      : Standard Evidential Deep Learning (Sensoy et al., NeurIPS 2018)
+    - redl     : Relaxed Evidential Deep Learning (Chen et al., ICLR 2024)
+    - fedl     : Flexible Evidential Deep Learning (Yoon & Kim, NeurIPS 2025)
+    - softmax  : Standard Cross-Entropy baseline
 
-Experiment design:
-    - HAM10000
-    - Lesion-level StratifiedGroupKFold split
-    - WeightedRandomSampler for class imbalance
-    - EfficientNet-B0 / MobileNetV3-Small / ShuffleNetV2
-    - Standard augmentation currently handled by datasets.ham10000
-    - Accuracy + ECE
-    - Best checkpoint selected using validation accuracy
+Supported Lightweight Backbones:
+    - efficientnet_b0
+    - mobilenet_v3_small
+    - shufflenet_v2
 
-Example R-EDL run:
+Example Colab Execution (F-EDL Screening on EfficientNet-B0):
 
     python train.py \
         --backbone efficientnet_b0 \
-        --loss_fn redl \
-        --redl_lambda 0.1 \
+        --loss_fn fedl \
         --dataset ham10000 \
         --augmentation standard \
         --seed 42 \
-        --data_root data/ham10000 \
+        --data_root /content/ham10000 \
         --epochs 30 \
         --batch_size 32 \
         --lr 1e-4 \
-        --annealing_step 10 \
-        --patience 8 \
-        --checkpoint_dir checkpoints \
-        --log_path results/framework_screening.csv
+        --patience 5 \
+        --checkpoint_dir /content/drive/MyDrive/Lightweight-EDL-Medical/checkpoints \
+        --log_path /content/drive/MyDrive/Lightweight-EDL-Medical/results/master_log.csv
 """
 
 import argparse
@@ -48,8 +47,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
 from sklearn.model_selection import StratifiedGroupKFold
 
 from datasets.ham10000 import (
@@ -71,7 +69,6 @@ from losses.fedl_loss import (
 )
 
 from metrics.ece import compute_ece
-
 from models.backbone_factory import get_backbone
 from models.fedl_wrapper import FEDLWrapper
 
@@ -82,488 +79,173 @@ from models.fedl_wrapper import FEDLWrapper
 
 def set_seed(seed: int):
     """Set random seeds for reproducible experiments."""
-
     random.seed(seed)
     np.random.seed(seed)
-
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
 
 # ============================================================
-# Command-line arguments
+# Command-line Arguments
 # ============================================================
 
 def parse_args():
-
     p = argparse.ArgumentParser(
-        description="Train EDL, R-EDL, F-EDL, or Softmax model on HAM10000."
+        description="Train EDL, R-EDL, F-EDL, or Softmax model on HAM10000 in Google Colab."
     )
-
-    # --------------------------------------------------------
-    # Backbone
-    # --------------------------------------------------------
 
     p.add_argument(
         "--backbone",
         default="efficientnet_b0",
-        choices=[
-            "efficientnet_b0",
-            "mobilenet_v3_small",
-            "shufflenet_v2",
-        ],
+        choices=["efficientnet_b0", "mobilenet_v3_small", "shufflenet_v2"],
     )
-
-    # --------------------------------------------------------
-    # Loss function
-    # --------------------------------------------------------
 
     p.add_argument(
         "--loss_fn",
         default="edl",
-        choices=[
-            "edl",
-            "redl",
-            "softmax",
-            "fedl",
-        ],
+        choices=["edl", "redl", "softmax", "fedl"],
     )
 
-    # --------------------------------------------------------
-    # Dataset
-    # --------------------------------------------------------
-
-    p.add_argument(
-        "--dataset",
-        default="ham10000",
-    )
-
-    # --------------------------------------------------------
-    # Augmentation label
-    # --------------------------------------------------------
+    p.add_argument("--dataset", default="ham10000")
 
     p.add_argument(
         "--augmentation",
         default="standard",
-        help=(
-            "Label for the augmentation strategy used "
-            "(e.g. standard, mixup, cutmix, randaugment). "
-            "Actual augmentation logic is implemented "
-            "in datasets/*.py."
-        ),
+        help="Label for the augmentation strategy (e.g. standard, mixup, cutmix, randaugment).",
     )
-
-    # --------------------------------------------------------
-    # Dataset root
-    # --------------------------------------------------------
 
     p.add_argument(
         "--data_root",
-        default="data/ham10000",
+        default="/content/ham10000",
+        help="Root directory containing HAM10000 images and metadata.",
     )
 
-    # --------------------------------------------------------
-    # Training parameters
-    # --------------------------------------------------------
-
-    p.add_argument(
-        "--epochs",
-        type=int,
-        default=20,
-    )
-
-    p.add_argument(
-        "--batch_size",
-        type=int,
-        default=32,
-    )
-
-    p.add_argument(
-        "--lr",
-        type=float,
-        default=1e-4,
-    )
-
-    p.add_argument(
-        "--annealing_step",
-        type=int,
-        default=10,
-    )
-
-    # --------------------------------------------------------
-    # R-EDL lambda
-    # --------------------------------------------------------
+    p.add_argument("--epochs", type=int, default=30)
+    p.add_argument("--batch_size", type=int, default=32)
+    p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--annealing_step", type=int, default=10)
 
     p.add_argument(
         "--redl_lambda",
         type=float,
         default=0.1,
-        help=(
-            "Prior weight hyperparameter for R-EDL. "
-            "Used only when --loss_fn redl."
-        ),
+        help="Prior weight hyperparameter for R-EDL. Used only when --loss_fn redl.",
     )
 
-    # --------------------------------------------------------
-    # Reproducibility
-    # --------------------------------------------------------
-
-    p.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-    )
-
-    # --------------------------------------------------------
-    # Validation split
-    # --------------------------------------------------------
-
-    p.add_argument(
-        "--val_split",
-        type=float,
-        default=0.15,
-    )
-
-    # --------------------------------------------------------
-    # Debug subset
-    # --------------------------------------------------------
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--val_split", type=float, default=0.15)
 
     p.add_argument(
         "--debug_subset",
         type=int,
         default=None,
-        help=(
-            "If set, train using only N samples "
-            "for a fast sanity check."
-        ),
+        help="If set, train using only N samples for a fast sanity check.",
     )
 
-    # --------------------------------------------------------
-    # Early stopping
-    # --------------------------------------------------------
-
-    p.add_argument(
-        "--patience",
-        type=int,
-        default=5,
-        help="Early stopping patience.",
-    )
-
-    # --------------------------------------------------------
-    # Checkpoints
-    # --------------------------------------------------------
+    p.add_argument("--patience", type=int, default=5, help="Early stopping patience.")
 
     p.add_argument(
         "--checkpoint_dir",
-        default="checkpoints",
-        help="Directory where experiment checkpoints are stored.",
+        default="/content/drive/MyDrive/Lightweight-EDL-Medical/checkpoints",
+        help="Google Drive directory where experiment checkpoints are saved.",
     )
-
-    # --------------------------------------------------------
-    # Results log
-    # --------------------------------------------------------
 
     p.add_argument(
         "--log_path",
-        default="results/master_log.csv",
+        default="/content/drive/MyDrive/Lightweight-EDL-Medical/results/master_log.csv",
+        help="Google Drive path to the master CSV experiment log.",
     )
 
     return p.parse_args()
 
 
 # ============================================================
-# Checkpoint identity
+# Checkpoint Naming Logic
 # ============================================================
 
 def checkpoint_path(
-    checkpoint_dir,
-    dataset,
-    backbone,
-    loss_fn,
-    augmentation,
-    seed,
-    debug_subset=None,
-    redl_lambda=0.1,
+    checkpoint_dir, dataset, backbone, loss_fn, augmentation, seed, debug_subset=None, redl_lambda=0.1,
 ):
-    """
-    Generate a unique checkpoint filename.
-
-    Standard EDL / Softmax:
-
-        ham10000_efficientnet_b0_edl_standard_seed42.pt
-
-    R-EDL:
-
-        ham10000_efficientnet_b0_redl_standard_seed42_lam0.1.pt
-
-    Debug run:
-
-        ham10000_efficientnet_b0_redl_standard_seed42_lam0.1_debug50.pt
-    """
-
-    debug_suffix = (
-        f"_debug{debug_subset}"
-        if debug_subset is not None
-        else ""
-    )
-
-    lambda_suffix = (
-        f"_lam{redl_lambda:g}"
-        if loss_fn == "redl"
-        else ""
-    )
-
-    fname = (
-        f"{dataset}_"
-        f"{backbone}_"
-        f"{loss_fn}_"
-        f"{augmentation}_"
-        f"seed{seed}"
-        f"{lambda_suffix}"
-        f"{debug_suffix}.pt"
-    )
-
-    return os.path.join(
-        checkpoint_dir,
-        fname,
-    )
+    debug_suffix = f"_debug{debug_subset}" if debug_subset is not None else ""
+    lambda_suffix = f"_lam{redl_lambda:g}" if loss_fn == "redl" else ""
+    fname = f"{dataset}_{backbone}_{loss_fn}_{augmentation}_seed{seed}{lambda_suffix}{debug_suffix}.pt"
+    return os.path.join(checkpoint_dir, fname)
 
 
 def best_checkpoint_path(ckpt_path):
-    """
-    Convert latest checkpoint path into best checkpoint path.
-    """
-
-    root, ext = os.path.splitext(
-        ckpt_path
-    )
-
+    root, ext = os.path.splitext(ckpt_path)
     return f"{root}_best{ext}"
 
 
 # ============================================================
-# Save checkpoint
+# Checkpoint Save & Load
 # ============================================================
 
-def save_checkpoint(
-    path,
-    model,
-    optimizer,
-    epoch,
-    args,
-    best_metric,
-    best_epoch,
-):
-    """
-    Save:
-
-        - model state
-        - optimizer state
-        - experiment configuration
-        - hyperparameters
-        - best validation information
-    """
-
+def save_checkpoint(path, model, optimizer, epoch, args, best_metric, best_epoch):
     directory = os.path.dirname(path)
-
     if directory:
-        os.makedirs(
-            directory,
-            exist_ok=True,
-        )
+        os.makedirs(directory, exist_ok=True)
 
     torch.save(
         {
-            # ------------------------------------------------
-            # Training state
-            # ------------------------------------------------
-
             "epoch": epoch,
-
-            "model_state_dict":
-                model.state_dict(),
-
-            "optimizer_state_dict":
-                optimizer.state_dict(),
-
-            # ------------------------------------------------
-            # Experiment identity
-            # ------------------------------------------------
-
-            "dataset":
-                args.dataset,
-
-            "backbone":
-                args.backbone,
-
-            "loss_fn":
-                args.loss_fn,
-
-            "augmentation":
-                args.augmentation,
-
-            "seed":
-                args.seed,
-
-            # ------------------------------------------------
-            # Hyperparameters
-            # ------------------------------------------------
-
-            "batch_size":
-                args.batch_size,
-
-            "lr":
-                args.lr,
-
-            "annealing_step":
-                args.annealing_step,
-
-            "redl_lambda":
-                args.redl_lambda,
-
-            "val_split":
-                args.val_split,
-
-            # ------------------------------------------------
-            # Best validation result
-            # ------------------------------------------------
-
-            "best_metric":
-                best_metric,
-
-            "best_epoch":
-                best_epoch,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "dataset": args.dataset,
+            "backbone": args.backbone,
+            "loss_fn": args.loss_fn,
+            "augmentation": args.augmentation,
+            "seed": args.seed,
+            "batch_size": args.batch_size,
+            "lr": args.lr,
+            "annealing_step": args.annealing_step,
+            "redl_lambda": args.redl_lambda,
+            "val_split": args.val_split,
+            "best_metric": best_metric,
+            "best_epoch": best_epoch,
         },
         path,
     )
 
 
-# ============================================================
-# Load checkpoint
-# ============================================================
-
-def load_checkpoint_if_exists(
-    path,
-    model,
-    optimizer,
-    device,
-):
-    """
-    Resume from latest checkpoint if available.
-
-    Returns:
-
-        resume_epoch
-        best_metric
-        best_epoch
-    """
-
+def load_checkpoint_if_exists(path, model, optimizer, device):
     if not os.path.exists(path):
+        return 1, -1.0, 0
 
-        return (
-            1,
-            -1.0,
-            0,
-        )
+    ckpt = torch.load(path, map_location=device)
+    model.load_state_dict(ckpt["model_state_dict"])
+    optimizer.load_state_dict(ckpt["optimizer_state_dict"])
 
-    ckpt = torch.load(
-        path,
-        map_location=device,
-    )
+    resume_epoch = ckpt["epoch"] + 1
+    best_metric = ckpt.get("best_metric", -1.0)
+    best_epoch = ckpt.get("best_epoch", 0)
 
-    # --------------------------------------------------------
-    # Restore model
-    # --------------------------------------------------------
-
-    model.load_state_dict(
-        ckpt["model_state_dict"]
-    )
-
-    # --------------------------------------------------------
-    # Restore optimizer
-    # --------------------------------------------------------
-
-    optimizer.load_state_dict(
-        ckpt["optimizer_state_dict"]
-    )
-
-    # --------------------------------------------------------
-    # Restore tracking information
-    # --------------------------------------------------------
-
-    resume_epoch = (
-        ckpt["epoch"] + 1
-    )
-
-    best_metric = ckpt.get(
-        "best_metric",
-        -1.0,
-    )
-
-    best_epoch = ckpt.get(
-        "best_epoch",
-        0,
-    )
-
+    print(f"Found existing checkpoint at: {path}")
+    print(f"Resuming execution from epoch {resume_epoch}")
     print(
-        f"Found checkpoint at {path}"
-    )
-
-    print(
-        f"Resuming from epoch {resume_epoch}"
-    )
-
-    print(
-        "Checkpoint config: "
+        "Checkpoint Config: "
         f"{ckpt.get('dataset', 'unknown')}/"
         f"{ckpt.get('backbone', 'unknown')}/"
         f"{ckpt.get('loss_fn', 'unknown')}/"
         f"{ckpt.get('augmentation', 'unknown')}/"
         f"seed{ckpt.get('seed', 'unknown')}"
     )
-
     if ckpt.get("loss_fn") == "redl":
-
-        print(
-            f"Checkpoint R-EDL lambda: "
-            f"{ckpt.get('redl_lambda', 'unknown')}"
-        )
-
+        print(f"Checkpoint R-EDL lambda: {ckpt.get('redl_lambda', 'unknown')}")
     if ckpt.get("loss_fn") == "fedl":
         print("Checkpoint F-EDL configuration detected.")
 
-    print(
-        f"Previous best validation accuracy: "
-        f"{best_metric:.4f} "
-        f"(epoch {best_epoch})"
-    )
-
-    return (
-        resume_epoch,
-        best_metric,
-        best_epoch,
-    )
+    print(f"Previous best validation accuracy: {best_metric:.4f} (epoch {best_epoch})")
+    return resume_epoch, best_metric, best_epoch
 
 
 # ============================================================
-# Evaluation
+# Model Evaluation
 # ============================================================
 
-def evaluate(
-    model,
-    loader,
-    device,
-    num_classes,
-    loss_fn,
-    redl_lambda=0.1,
-):
-    """Evaluate accuracy, ECE, and reliability-diagram bins."""
-
+def evaluate(model, loader, device, num_classes, loss_fn, redl_lambda=0.1):
     model.eval()
-
-    all_conf = []
-    all_pred = []
-    all_label = []
+    all_conf, all_pred, all_label = [], [], []
 
     with torch.no_grad():
         for images, labels in loader:
@@ -572,26 +254,14 @@ def evaluate(
 
             if loss_fn == "edl":
                 pred_class, confidence, _ = edl_predictions(output)
-
             elif loss_fn == "redl":
-                pred_class, confidence, _ = redl_predictions(
-                    output, lam=redl_lambda
-                )
-
+                pred_class, confidence, _ = redl_predictions(output, lam=redl_lambda)
             elif loss_fn == "fedl":
                 alpha, p, tau = output
-                (
-                    pred_class,
-                    confidence,
-                    _total_uncertainty,
-                    _epistemic_uncertainty,
-                    _aleatoric_uncertainty,
-                ) = fedl_predictions(alpha, p, tau)
-
+                pred_class, confidence, *_ = fedl_predictions(alpha, p, tau)
             elif loss_fn == "softmax":
                 probs = torch.softmax(output, dim=1)
                 confidence, pred_class = torch.max(probs, dim=1)
-
             else:
                 raise ValueError(f"Unsupported loss function: {loss_fn}")
 
@@ -603,1007 +273,271 @@ def evaluate(
     all_label = np.array(all_label)
 
     accuracy = float(np.mean(all_pred == all_label))
-
-    ece, bin_data = compute_ece(
-        all_conf,
-        all_pred,
-        all_label,
-        n_bins=15,
-    )
+    ece, bin_data = compute_ece(all_conf, all_pred, all_label, n_bins=15)
 
     return accuracy, ece, bin_data
 
 
 # ============================================================
-# CSV logging
+# Master CSV Writer
 # ============================================================
 
-def write_log_row(
-    log_path,
-    log_row,
-):
-    """
-    Append an experiment result to CSV.
-
-    If an existing CSV has an incompatible header, a new file
-    with '_v2' suffix is created instead of corrupting the
-    previous results.
-    """
-
-    directory = os.path.dirname(
-        log_path
-    )
-
+def write_log_row(log_path, log_row):
+    directory = os.path.dirname(log_path)
     if directory:
-        os.makedirs(
-            directory,
-            exist_ok=True,
-        )
+        os.makedirs(directory, exist_ok=True)
 
-    fieldnames = list(
-        log_row.keys()
-    )
-
+    fieldnames = list(log_row.keys())
     actual_log_path = log_path
 
-    # --------------------------------------------------------
-    # Existing file
-    # --------------------------------------------------------
-
     if os.path.exists(log_path):
-
-        with open(
-            log_path,
-            "r",
-            newline="",
-        ) as f:
-
+        with open(log_path, "r", newline="") as f:
             reader = csv.reader(f)
-
             try:
-                existing_header = next(
-                    reader
-                )
+                existing_header = next(reader)
             except StopIteration:
                 existing_header = []
 
-        # ----------------------------------------------------
-        # Compatible header
-        # ----------------------------------------------------
-
         if existing_header == fieldnames:
-
             write_header = False
-
-        # ----------------------------------------------------
-        # Incompatible header
-        # ----------------------------------------------------
-
         else:
-
-            root, ext = os.path.splitext(
-                log_path
-            )
-
-            actual_log_path = (
-                f"{root}_v2{ext}"
-            )
-
-            print(
-                f"Existing CSV schema differs."
-            )
-
-            print(
-                f"Using new log file: "
-                f"{actual_log_path}"
-            )
-
-            write_header = not os.path.exists(
-                actual_log_path
-            )
-
+            root, ext = os.path.splitext(log_path)
+            actual_log_path = f"{root}_v2{ext}"
+            print(f"CSV header mismatch detected. Diverting entry to: {actual_log_path}")
+            write_header = not os.path.exists(actual_log_path)
     else:
-
         write_header = True
 
-    # --------------------------------------------------------
-    # Write
-    # --------------------------------------------------------
-
-    with open(
-        actual_log_path,
-        "a",
-        newline="",
-    ) as f:
-
-        writer = csv.DictWriter(
-            f,
-            fieldnames=fieldnames,
-        )
-
+    with open(actual_log_path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
         if write_header:
-
             writer.writeheader()
-
-        writer.writerow(
-            log_row
-        )
+        writer.writerow(log_row)
 
     return actual_log_path
 
 
 # ============================================================
-# Main training function
+# Main Loop
 # ============================================================
 
 def main():
-
-    # ========================================================
-    # Arguments
-    # ========================================================
-
     args = parse_args()
+    set_seed(args.seed)
 
-    # ========================================================
-    # Reproducibility
-    # ========================================================
-
-    set_seed(
-        args.seed
-    )
-
-    # ========================================================
-    # Device
-    # ========================================================
-
-    device = torch.device(
-        "cuda"
-        if torch.cuda.is_available()
-        else "cpu"
-    )
-
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using compute device: {device}")
     print(
-        f"Using device: {device}"
-    )
-
-    # ========================================================
-    # Experiment information
-    # ========================================================
-
-    print(
-        f"Experiment: "
-        f"dataset={args.dataset} "
-        f"backbone={args.backbone} "
-        f"loss_fn={args.loss_fn} "
-        f"augmentation={args.augmentation} "
-        f"seed={args.seed}"
+        f"Experiment setup: dataset={args.dataset} | backbone={args.backbone} | "
+        f"loss_fn={args.loss_fn} | augmentation={args.augmentation} | seed={args.seed}"
     )
 
     if args.loss_fn == "redl":
-
-        print(
-            f"R-EDL lambda: "
-            f"{args.redl_lambda}"
-        )
-
+        print(f"R-EDL lambda hyperparameter: {args.redl_lambda}")
     if args.loss_fn == "fedl":
+        print("F-EDL mode active: controlled adaptation (no spectral normalization).")
 
-        print(
-            "F-EDL: controlled adaptation; "
-            "spectral normalization is not enabled."
-        )
-
-    # ========================================================
-    # Directories
-    # ========================================================
-
-    os.makedirs(
-        args.checkpoint_dir,
-        exist_ok=True,
-    )
-
-    os.makedirs(
-        os.path.dirname(
-            args.log_path
-        ) or ".",
-        exist_ok=True,
-    )
-
-    # ========================================================
-    # Dataset check
-    # ========================================================
+    os.makedirs(args.checkpoint_dir, exist_ok=True)
+    os.makedirs(os.path.dirname(args.log_path) or ".", exist_ok=True)
 
     if args.dataset != "ham10000":
+        raise NotImplementedError("Only ham10000 is supported in this pipeline.")
 
-        raise NotImplementedError(
-            "Only ham10000 is wired up right now. "
-            "Add other datasets under datasets/."
-        )
+    num_classes = len(CLASS_NAMES)
 
-    # ========================================================
-    # Number of classes
-    # ========================================================
+    full_dataset = HAM10000Dataset(args.data_root, transform=default_transforms(train=True))
+    val_dataset_raw = HAM10000Dataset(args.data_root, transform=default_transforms(train=False))
 
-    num_classes = len(
-        CLASS_NAMES
-    )
+    n = len(full_dataset)
+    all_indices = np.arange(n)
+    all_labels = np.array(full_dataset.labels)
+    all_lesion_ids = full_dataset.metadata["lesion_id"].values
 
-    # ========================================================
-    # Load training dataset
-    # ========================================================
+    # Stratified Group K-Fold split (zero lesion leakage)
+    n_splits = round(1 / args.val_split)
+    sgkf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=args.seed)
+    train_indices, val_indices = next(sgkf.split(all_indices, all_labels, groups=all_lesion_ids))
 
-    full_dataset = HAM10000Dataset(
-        args.data_root,
-        transform=default_transforms(
-            train=True
-        ),
-    )
-
-    # ========================================================
-    # Load validation dataset
-    # ========================================================
-
-    val_dataset_raw = HAM10000Dataset(
-        args.data_root,
-        transform=default_transforms(
-            train=False
-        ),
-    )
-
-    # ========================================================
-    # Lesion-level split
-    # ========================================================
-
-    n = len(
-        full_dataset
-    )
-
-    all_indices = np.arange(
-        n
-    )
-
-    all_labels = np.array(
-        full_dataset.labels
-    )
-
-    all_lesion_ids = (
-        full_dataset.metadata[
-            "lesion_id"
-        ].values
-    )
-
-    # --------------------------------------------------------
-    # Approximately 15% validation
-    # --------------------------------------------------------
-
-    n_splits = round(
-        1 / args.val_split
-    )
-
-    sgkf = StratifiedGroupKFold(
-        n_splits=n_splits,
-        shuffle=True,
-        random_state=args.seed,
-    )
-
-    train_indices, val_indices = next(
-        sgkf.split(
-            all_indices,
-            all_labels,
-            groups=all_lesion_ids,
-        )
-    )
-
-    # ========================================================
-    # Leakage check
-    # ========================================================
-
-    train_lesions = set(
-        all_lesion_ids[
-            train_indices
-        ]
-    )
-
-    val_lesions = set(
-        all_lesion_ids[
-            val_indices
-        ]
-    )
-
-    overlap = (
-        train_lesions
-        &
-        val_lesions
-    )
-
-    print(
-        f"Lesion overlap between train/val: "
-        f"{len(overlap)} (should be 0)"
-    )
-
+    train_lesions = set(all_lesion_ids[train_indices])
+    val_lesions = set(all_lesion_ids[val_indices])
+    overlap = train_lesions & val_lesions
+    print(f"Lesion overlap between train and validation splits: {len(overlap)} (must be 0)")
     if len(overlap) != 0:
+        raise RuntimeError(f"Lesion leakage detected! {len(overlap)} lesion(s) appear in both splits.")
 
-        raise RuntimeError(
-            f"Lesion leakage detected: "
-            f"{len(overlap)} lesion(s) appear "
-            f"in both train and validation splits."
-        )
-
-    # ========================================================
-    # Class distribution
-    # ========================================================
-
-    print(
-        "Train class distribution:",
-        pd.Series(
-            all_labels[
-                train_indices
-            ]
-        )
-        .value_counts()
-        .sort_index()
-        .to_dict(),
-    )
-
-    print(
-        "Validation class distribution:",
-        pd.Series(
-            all_labels[
-                val_indices
-            ]
-        )
-        .value_counts()
-        .sort_index()
-        .to_dict(),
-    )
-
-    # ========================================================
-    # Debug subset
-    # ========================================================
+    print("Train class distribution:", pd.Series(all_labels[train_indices]).value_counts().sort_index().to_dict())
+    print("Val class distribution:  ", pd.Series(all_labels[val_indices]).value_counts().sort_index().to_dict())
 
     if args.debug_subset is not None:
+        if args.debug_subset <= 0 or args.debug_subset > len(train_indices):
+            raise ValueError(f"--debug_subset must be between 1 and {len(train_indices)}.")
+        train_indices = train_indices[:args.debug_subset]
 
-        if args.debug_subset <= 0:
+    train_subset = Subset(full_dataset, train_indices)
+    val_subset = Subset(val_dataset_raw, val_indices)
 
-            raise ValueError(
-                "--debug_subset must be greater than 0."
-            )
-
-        if args.debug_subset > len(
-            train_indices
-        ):
-
-            raise ValueError(
-                "--debug_subset cannot exceed "
-                "the number of training samples."
-            )
-
-        train_indices = (
-            train_indices[
-                :args.debug_subset
-            ]
-        )
-
-    # ========================================================
-    # Dataset subsets
-    # ========================================================
-
-    train_subset = Subset(
-        full_dataset,
-        train_indices,
-    )
-
-    val_subset = Subset(
-        val_dataset_raw,
-        val_indices,
-    )
-
-    # ========================================================
-    # Class balancing
-    # ========================================================
-
-    train_labels = [
-        full_dataset.labels[i]
-        for i in train_indices
-    ]
-
-    class_counts = np.bincount(
-        train_labels,
-        minlength=num_classes,
-    )
-
-    class_weights = (
-        1.0
-        /
-        np.maximum(
-            class_counts,
-            1,
-        )
-    )
-
-    sample_weights = [
-        class_weights[label]
-        for label in train_labels
-    ]
-
-    sampler = (
-        torch.utils.data.WeightedRandomSampler(
-            sample_weights,
-            num_samples=len(
-                sample_weights
-            ),
-            replacement=True,
-        )
-    )
+    # Class balancing via WeightedRandomSampler
+    train_labels = [full_dataset.labels[i] for i in train_indices]
+    class_counts = np.bincount(train_labels, minlength=num_classes)
+    class_weights = 1.0 / np.maximum(class_counts, 1)
+    sample_weights = [class_weights[label] for label in train_labels]
+    sampler = WeightedRandomSampler(sample_weights, num_samples=len(sample_weights), replacement=True)
 
     print(
-        f"Train samples: "
-        f"{len(train_subset)} "
-        f"| Val samples: "
-        f"{len(val_subset)} "
-        f"| Sampler: "
-        f"{type(sampler).__name__} "
-        f"| Lesion-level split, "
-        f"n_splits={n_splits}"
+        f"Train samples: {len(train_subset)} | Val samples: {len(val_subset)} "
+        f"| Sampler: {type(sampler).__name__} | Lesion-level split (n_splits={n_splits})"
     )
 
-    # ========================================================
-    # DataLoaders
-    # ========================================================
+    train_loader = DataLoader(train_subset, batch_size=args.batch_size, sampler=sampler, num_workers=2)
+    val_loader = DataLoader(val_subset, batch_size=args.batch_size, shuffle=False, num_workers=2)
 
-    train_loader = DataLoader(
-        train_subset,
-        batch_size=args.batch_size,
-        sampler=sampler,
-        num_workers=2,
-    )
-
-    val_loader = DataLoader(
-        val_subset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=2,
-    )
-
-    # ========================================================
-    # Model
-    # ========================================================
-
+    # Model instantiation
     if args.loss_fn == "fedl":
-
-        model = FEDLWrapper(
-            backbone_name=args.backbone,
-            num_classes=num_classes,
-            pretrained=True,
-        ).to(device)
-
-        print(
-            "F-EDL mode: using FEDLWrapper "
-            "(alpha, p, tau outputs)."
-        )
-
+        model = FEDLWrapper(backbone_name=args.backbone, num_classes=num_classes, pretrained=True).to(device)
+        print("F-EDL mode active: using FEDLWrapper (alpha, p, tau outputs).")
     else:
+        model = get_backbone(args.backbone, num_classes=num_classes, pretrained=True).to(device)
 
-        model = get_backbone(
-            args.backbone,
-            num_classes=num_classes,
-            pretrained=True,
-        ).to(device)
-
-    # ========================================================
-    # Optimizer
-    # ========================================================
-
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=args.lr,
-    )
-
-    # ========================================================
-    # Checkpoint paths
-    # ========================================================
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
     ckpt_path = checkpoint_path(
-        args.checkpoint_dir,
-        args.dataset,
-        args.backbone,
-        args.loss_fn,
-        args.augmentation,
-        args.seed,
-        args.debug_subset,
-        args.redl_lambda,
+        args.checkpoint_dir, args.dataset, args.backbone, args.loss_fn,
+        args.augmentation, args.seed, args.debug_subset, args.redl_lambda,
     )
+    best_path = best_checkpoint_path(ckpt_path)
 
-    best_path = best_checkpoint_path(
-        ckpt_path
-    )
+    print(f"Latest checkpoint target: {ckpt_path}")
+    print(f"Best checkpoint target:   {best_path}")
 
-    print(
-        f"Checkpoint path: "
-        f"{ckpt_path}"
-    )
-
-    print(
-        f"Best checkpoint path: "
-        f"{best_path}"
-    )
-
-    # ========================================================
-    # Resume
-    # ========================================================
-
-    (
-        start_epoch,
-        best_val_acc,
-        best_epoch,
-    ) = load_checkpoint_if_exists(
-        ckpt_path,
-        model,
-        optimizer,
-        device,
-    )
-
-    # ========================================================
-    # Early stopping
-    # ========================================================
-
+    start_epoch, best_val_acc, best_epoch = load_checkpoint_if_exists(ckpt_path, model, optimizer, device)
     epochs_no_improve = 0
-
-    # ========================================================
-    # Training loop
-    # ========================================================
-
-    # The loop may execute zero times when a completed latest
-    # checkpoint is resumed. Keeping an explicit epoch value for
-    # logging and final reporting.
     last_epoch = start_epoch - 1
 
-    for epoch in range(
-        start_epoch,
-        args.epochs + 1,
-    ):
-
+    # Training Loop
+    for epoch in range(start_epoch, args.epochs + 1):
         model.train()
-
         epoch_start = time.time()
-
         running_loss = 0.0
 
-        # ----------------------------------------------------
-        # Training batches
-        # ----------------------------------------------------
-
         for images, labels in train_loader:
-
-            images = images.to(
-                device
-            )
-
-            labels = labels.to(
-                device
-            )
+            images = images.to(device)
+            labels = labels.to(device)
 
             optimizer.zero_grad()
-
-            output = model(
-                images
-            )
-
-            # =================================================
-            # Standard EDL
-            # =================================================
+            output = model(images)
 
             if args.loss_fn == "edl":
-
                 loss = edl_mse_loss(
-                    output,
-                    labels,
-                    epoch_num=epoch,
-                    num_classes=num_classes,
-                    annealing_step=args.annealing_step,
-                    device=device,
+                    output, labels, epoch_num=epoch, num_classes=num_classes,
+                    annealing_step=args.annealing_step, device=device,
                 )
-
-            # =================================================
-            # R-EDL
-            # =================================================
-
             elif args.loss_fn == "redl":
-
                 loss = redl_loss(
-                    output,
-                    labels,
-                    epoch_num=epoch,
-                    num_classes=num_classes,
-                    annealing_step=args.annealing_step,
-                    device=device,
-                    lam=args.redl_lambda,
+                    output, labels, epoch_num=epoch, num_classes=num_classes,
+                    annealing_step=args.annealing_step, device=device, lam=args.redl_lambda,
                 )
-
-            # =================================================
-            # F-EDL
-            # =================================================
-
             elif args.loss_fn == "fedl":
-
                 alpha, p, tau = output
-
-                loss = fedl_loss(
-                    alpha,
-                    p,
-                    tau,
-                    labels,
-                    num_classes,
-                )
-
-            # =================================================
-            # Softmax
-            # =================================================
-
+                loss = fedl_loss(alpha, p, tau, labels, num_classes)
             elif args.loss_fn == "softmax":
-
-                loss = nn.functional.cross_entropy(
-                    output,
-                    labels,
-                )
-
+                loss = nn.functional.cross_entropy(output, labels)
             else:
-                raise ValueError(
-                    f"Unsupported loss function: {args.loss_fn}"
-                )
-
-            # ------------------------------------------------
-            # Backpropagation
-            # ------------------------------------------------
+                raise ValueError(f"Unsupported loss function: {args.loss_fn}")
 
             loss.backward()
-
             optimizer.step()
 
-            running_loss += (
-                loss.item()
-                *
-                images.size(0)
-            )
+            running_loss += loss.item() * images.size(0)
 
-        # ====================================================
-        # Average training loss
-        # ====================================================
-
-        train_loss = (
-            running_loss
-            /
-            len(train_subset)
-        )
-
-        # ====================================================
-        # Validation
-        # ====================================================
-
+        train_loss = running_loss / len(train_subset)
         val_acc, val_ece, _ = evaluate(
-            model,
-            val_loader,
-            device,
-            num_classes,
-            args.loss_fn,
-            redl_lambda=args.redl_lambda,
+            model, val_loader, device, num_classes, args.loss_fn, redl_lambda=args.redl_lambda,
         )
 
-        elapsed = (
-            time.time()
-            -
-            epoch_start
-        )
-
+        elapsed = time.time() - epoch_start
         print(
-            f"Epoch {epoch}/{args.epochs} | "
-            f"train_loss={train_loss:.4f} | "
-            f"val_acc={val_acc:.4f} | "
-            f"val_ece={val_ece:.4f} | "
-            f"{elapsed:.1f}s"
+            f"Epoch {epoch}/{args.epochs} | train_loss={train_loss:.4f} | "
+            f"val_acc={val_acc:.4f} | val_ece={val_ece:.4f} | {elapsed:.1f}s"
         )
 
         last_epoch = epoch
 
-        # ====================================================
-        # Best-model detection
-        # ====================================================
-
         if val_acc > best_val_acc:
-
             best_val_acc = val_acc
-
             best_epoch = epoch
-
             epochs_no_improve = 0
-
-            print(
-                f"  -> New best validation accuracy: "
-                f"{best_val_acc:.4f} "
-                f"(epoch {best_epoch})"
-            )
-
-            # ------------------------------------------------
-            # Save BEST checkpoint
-            # ------------------------------------------------
-
-            save_checkpoint(
-                best_path,
-                model,
-                optimizer,
-                epoch,
-                args,
-                best_val_acc,
-                best_epoch,
-            )
-
-            print(
-                f"  best checkpoint saved -> "
-                f"{best_path}"
-            )
-
+            print(f"  -> New best validation accuracy: {best_val_acc:.4f} (epoch {best_epoch})")
+            save_checkpoint(best_path, model, optimizer, epoch, args, best_val_acc, best_epoch)
+            print(f"  Best checkpoint saved -> {best_path}")
         else:
-
             epochs_no_improve += 1
 
-        # ====================================================
-        # Save latest/recovery checkpoint
-        # ====================================================
-
-        save_checkpoint(
-            ckpt_path,
-            model,
-            optimizer,
-            epoch,
-            args,
-            best_val_acc,
-            best_epoch,
-        )
-
-        print(
-            f"  checkpoint saved -> "
-            f"{ckpt_path}"
-        )
-
-        # ====================================================
-        # Early stopping
-        # ====================================================
+        save_checkpoint(ckpt_path, model, optimizer, epoch, args, best_val_acc, best_epoch)
+        print(f"  Latest checkpoint saved -> {ckpt_path}")
 
         if epochs_no_improve >= args.patience:
-
-            print(
-                f"Early stopping: "
-                f"no validation improvement "
-                f"in {args.patience} epochs."
-            )
-
+            print(f"Early stopping triggered: no validation improvement in {args.patience} epochs.")
             break
 
-    # ========================================================
-    # Reload BEST checkpoint
-    # ========================================================
-
-    if os.path.exists(
-        best_path
-    ):
-
-        print()
-        print(
-            f"Loading best checkpoint "
-            f"for final evaluation:"
-        )
-        print(
-            best_path
-        )
-
-        best_ckpt = torch.load(
-            best_path,
-            map_location=device,
-        )
-
-        model.load_state_dict(
-            best_ckpt[
-                "model_state_dict"
-            ]
-        )
-
-        print(
-            f"Best checkpoint epoch: "
-            f"{best_ckpt.get('epoch', 'unknown')}"
-        )
-
+    # Reload Best Model for Final Logging
+    if os.path.exists(best_path):
+        print(f"\nReloading best checkpoint for final evaluation:\n{best_path}")
+        best_ckpt = torch.load(best_path, map_location=device)
+        model.load_state_dict(best_ckpt["model_state_dict"])
+        print(f"Best checkpoint epoch: {best_ckpt.get('epoch', 'unknown')}")
     else:
-
-        print(
-            "WARNING: Best checkpoint not found. "
-            "Using current model for final evaluation."
-        )
-
-    # ========================================================
-    # Final evaluation
-    # ========================================================
+        print("\nWARNING: Best checkpoint file not found. Evaluating current state.")
 
     final_acc, final_ece, _ = evaluate(
-        model,
-        val_loader,
-        device,
-        num_classes,
-        args.loss_fn,
-        redl_lambda=args.redl_lambda,
+        model, val_loader, device, num_classes, args.loss_fn, redl_lambda=args.redl_lambda,
     )
 
-    # ========================================================
-    # Run ID
-    # ========================================================
-
-    run_id = (
-        f"{args.dataset}_"
-        f"{args.backbone}_"
-        f"{args.loss_fn}_"
-        f"{args.augmentation}_"
-        f"seed{args.seed}"
-    )
-
+    run_id = f"{args.dataset}_{args.backbone}_{args.loss_fn}_{args.augmentation}_seed{args.seed}"
     if args.loss_fn == "redl":
-
-        run_id += (
-            f"_lam{args.redl_lambda:g}"
-        )
-
-    # ========================================================
-    # CSV log row
-    # ========================================================
+        run_id += f"_lam{args.redl_lambda:g}"
 
     log_row = {
-
-        "run_id":
-            run_id,
-
-        "dataset":
-            args.dataset,
-
-        "backbone":
-            args.backbone,
-
-        "loss_fn":
-            args.loss_fn,
-
-        "augmentation":
-            args.augmentation,
-
-        "seed":
-            args.seed,
-
-        "epochs":
-            last_epoch,
-
-        "batch_size":
-            args.batch_size,
-
-        "learning_rate":
-            args.lr,
-
-        "annealing_step":
-            args.annealing_step,
-
-        "redl_lambda":
-            args.redl_lambda,
-
-        "train_samples":
-            len(train_subset),
-
-        "val_samples":
-            len(val_subset),
-
-        "accuracy":
-            final_acc,
-
-        "ece":
-            final_ece,
-
-        "ood_auroc":
-            "",
-
-        "latency":
-            "",
-
-        "best_epoch":
-            best_epoch,
-
-        "best_val_accuracy":
-            best_val_acc,
-
-        "checkpoint_path":
-            ckpt_path,
-
-        "best_checkpoint_path":
-            best_path,
+        "run_id": run_id,
+        "dataset": args.dataset,
+        "backbone": args.backbone,
+        "loss_fn": args.loss_fn,
+        "augmentation": args.augmentation,
+        "seed": args.seed,
+        "epochs": last_epoch,
+        "batch_size": args.batch_size,
+        "learning_rate": args.lr,
+        "annealing_step": args.annealing_step,
+        "redl_lambda": args.redl_lambda,
+        "train_samples": len(train_subset),
+        "val_samples": len(val_subset),
+        "accuracy": final_acc,
+        "ece": final_ece,
+        "ood_auroc": "",
+        "latency": "",
+        "best_epoch": best_epoch,
+        "best_val_accuracy": best_val_acc,
+        "checkpoint_path": ckpt_path,
+        "best_checkpoint_path": best_path,
     }
 
-    # ========================================================
-    # Write CSV
-    # ========================================================
+    actual_log_path = write_log_row(args.log_path, log_row)
 
-    actual_log_path = write_log_row(
-        args.log_path,
-        log_row,
-    )
-
-    # ========================================================
-    # Final summary
-    # ========================================================
-
-    print()
-
-    print(
-        "=" * 60
-    )
-
-    print(
-        "EXPERIMENT COMPLETE"
-    )
-
-    print(
-        "=" * 60
-    )
-
-    print(
-        f"Loss function            : "
-        f"{args.loss_fn}"
-    )
-
+    print("\n" + "=" * 60)
+    print("EXPERIMENT COMPLETE")
+    print("=" * 60)
+    print(f"Loss function            : {args.loss_fn}")
     if args.loss_fn == "redl":
-
-        print(
-            f"R-EDL lambda             : "
-            f"{args.redl_lambda}"
-        )
-
+        print(f"R-EDL lambda             : {args.redl_lambda}")
     if args.loss_fn == "fedl":
-        print(
-            "F-EDL adaptation         : "
-            "controlled, no spectral normalization"
-        )
+        print("F-EDL adaptation         : controlled, no spectral normalization")
+    print(f"Best validation accuracy : {best_val_acc:.4f}")
+    print(f"Best epoch               : {best_epoch}")
+    print(f"Final validation accuracy: {final_acc:.4f}")
+    print(f"Final validation ECE     : {final_ece:.4f}")
+    print(f"Results logged to        : {actual_log_path}")
+    print(f"Latest checkpoint        : {ckpt_path}")
+    print(f"Best checkpoint          : {best_path}")
 
-    print(
-        f"Best validation accuracy : "
-        f"{best_val_acc:.4f}"
-    )
-
-    print(
-        f"Best epoch               : "
-        f"{best_epoch}"
-    )
-
-    print(
-        f"Final validation accuracy: "
-        f"{final_acc:.4f}"
-    )
-
-    print(
-        f"Final validation ECE     : "
-        f"{final_ece:.4f}"
-    )
-
-    print(
-        f"Results logged to        : "
-        f"{actual_log_path}"
-    )
-
-    print(
-        f"Latest checkpoint        : "
-        f"{ckpt_path}"
-    )
-
-    print(
-        f"Best checkpoint          : "
-        f"{best_path}"
-    )
-
-
-# ============================================================
-# Entry point
-# ============================================================
 
 if __name__ == "__main__":
     main()
