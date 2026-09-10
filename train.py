@@ -35,7 +35,11 @@ Example Colab Execution (F-EDL Screening on EfficientNet-B0):
         --patience 5 \
         --checkpoint_dir /content/drive/MyDrive/Lightweight-EDL-Medical/checkpoints \
         --log_path /content/drive/MyDrive/Lightweight-EDL-Medical/results/master_log.csv
+
 """
+
+
+
 
 import argparse
 import csv
@@ -47,6 +51,8 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+import torchvision.transforms as T
 from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
 from sklearn.model_selection import StratifiedGroupKFold
 
@@ -111,12 +117,13 @@ def parse_args():
     p.add_argument(
         "--augmentation",
         default="standard",
-        help="Label for the augmentation strategy (e.g. standard, mixup, cutmix, randaugment).",
+        choices=["standard", "mixup", "cutmix", "randaugment"],
+        help="Training augmentation strategy.",
     )
 
     p.add_argument(
         "--data_root",
-        default="/content/ham10000",
+        default="/content/data/ham10000",
         help="Root directory containing HAM10000 images and metadata.",
     )
 
@@ -318,6 +325,177 @@ def write_log_row(log_path, log_row):
 
 
 # ============================================================
+# Data Augmentation
+# ============================================================
+
+def get_train_transforms(augmentation_name):
+    """
+    Build training transforms.
+
+    Standard:
+        Resize + horizontal flip + vertical flip
+
+    RandAugment:
+        Standard transforms + RandAugment
+
+    Mixup / CutMix:
+        Standard image transforms.
+        Mixing is performed at batch level in the training loop.
+
+    Validation is NOT affected by this function.
+    """
+    transform_list = [
+        T.Resize((224, 224)),
+        T.RandomHorizontalFlip(),
+        T.RandomVerticalFlip(),
+    ]
+
+    if augmentation_name == "randaugment":
+        transform_list.append(
+            T.RandAugment(
+                num_ops=2,
+                magnitude=9,
+            )
+        )
+
+    transform_list.extend([
+        T.ToTensor(),
+        T.Normalize(
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225],
+        ),
+    ])
+
+    return T.Compose(transform_list)
+
+
+def apply_mixup(images, labels, num_classes, alpha=0.2):
+    """
+    Apply Mixup to a mini-batch.
+
+    Returns:
+        mixed_images : [B, C, H, W]
+        mixed_targets: [B, K]
+    """
+    if alpha <= 0:
+        return images, labels
+
+    lam = np.random.beta(alpha, alpha)
+
+    index = torch.randperm(
+        images.size(0),
+        device=images.device,
+    )
+
+    mixed_images = (
+        lam * images
+        + (1.0 - lam) * images[index]
+    )
+
+    y_onehot = F.one_hot(
+        labels.long(),
+        num_classes=num_classes,
+    ).float()
+
+    mixed_targets = (
+        lam * y_onehot
+        + (1.0 - lam) * y_onehot[index]
+    )
+
+    return mixed_images, mixed_targets
+
+
+def apply_cutmix(images, labels, num_classes, alpha=1.0):
+    """
+    Apply CutMix to a mini-batch.
+
+    Returns:
+        mixed_images : [B, C, H, W]
+        mixed_targets: [B, K]
+    """
+    if alpha <= 0:
+        return images, labels
+
+    lam = np.random.beta(alpha, alpha)
+
+    _, _, h, w = images.size()
+
+    index = torch.randperm(
+        images.size(0),
+        device=images.device,
+    )
+
+    cut_rat = np.sqrt(1.0 - lam)
+
+    cut_w = int(w * cut_rat)
+    cut_h = int(h * cut_rat)
+
+    cx = np.random.randint(w)
+    cy = np.random.randint(h)
+
+    bbx1 = int(np.clip(
+        cx - cut_w // 2,
+        0,
+        w,
+    ))
+
+    bby1 = int(np.clip(
+        cy - cut_h // 2,
+        0,
+        h,
+    ))
+
+    bbx2 = int(np.clip(
+        cx + cut_w // 2,
+        0,
+        w,
+    ))
+
+    bby2 = int(np.clip(
+        cy + cut_h // 2,
+        0,
+        h,
+    ))
+
+    mixed_images = images.clone()
+
+    mixed_images[
+        :,
+        :,
+        bby1:bby2,
+        bbx1:bbx2
+    ] = images[
+        index,
+        :,
+        bby1:bby2,
+        bbx1:bbx2
+    ]
+
+    patch_area = (
+        (bbx2 - bbx1)
+        * (bby2 - bby1)
+    )
+
+    lam_adjusted = (
+        1.0
+        - patch_area / float(w * h)
+    )
+
+    y_onehot = F.one_hot(
+        labels.long(),
+        num_classes=num_classes,
+    ).float()
+
+    mixed_targets = (
+        lam_adjusted * y_onehot
+        + (1.0 - lam_adjusted)
+        * y_onehot[index]
+    )
+
+    return mixed_images, mixed_targets
+
+
+# ============================================================
 # Main Loop
 # ============================================================
 
@@ -343,10 +521,26 @@ def main():
     if args.dataset != "ham10000":
         raise NotImplementedError("Only ham10000 is supported in this pipeline.")
 
+    if args.augmentation in {"mixup", "cutmix"} and args.loss_fn != "fedl":
+        raise ValueError(
+            f"Augmentation '{args.augmentation}' produces soft targets [B, K], "
+            f"which is currently supported only with '--loss_fn fedl'. "
+            f"Use 'standard' or 'randaugment' for loss_fn='{args.loss_fn}'."
+        )
+
     num_classes = len(CLASS_NAMES)
 
-    full_dataset = HAM10000Dataset(args.data_root, transform=default_transforms(train=True))
-    val_dataset_raw = HAM10000Dataset(args.data_root, transform=default_transforms(train=False))
+    train_transform = get_train_transforms(args.augmentation)
+
+    full_dataset = HAM10000Dataset(
+        args.data_root,
+        transform=train_transform,
+    )
+
+    val_dataset_raw = HAM10000Dataset(
+        args.data_root,
+        transform=default_transforms(train=False),
+    )
 
     n = len(full_dataset)
     all_indices = np.arange(n)
@@ -423,24 +617,54 @@ def main():
             images = images.to(device)
             labels = labels.to(device)
 
+            # --------------------------------------------------------
+            # Apply selected training augmentation
+            # --------------------------------------------------------
+            if args.augmentation == "mixup":
+                images, targets = apply_mixup(
+                    images,
+                    labels,
+                    num_classes,
+                    alpha=0.2,
+                )
+            elif args.augmentation == "cutmix":
+                images, targets = apply_cutmix(
+                    images,
+                    labels,
+                    num_classes,
+                    alpha=1.0,
+                )
+            else:
+                # Standard / RandAugment pass ordinary integer class indices [B]
+                targets = labels
+
+            # --------------------------------------------------------
+            # Forward pass & Loss computation
+            # --------------------------------------------------------
             optimizer.zero_grad()
             output = model(images)
 
             if args.loss_fn == "edl":
                 loss = edl_mse_loss(
-                    output, labels, epoch_num=epoch, num_classes=num_classes,
+                    output, targets, epoch_num=epoch, num_classes=num_classes,
                     annealing_step=args.annealing_step, device=device,
                 )
             elif args.loss_fn == "redl":
                 loss = redl_loss(
-                    output, labels, epoch_num=epoch, num_classes=num_classes,
+                    output, targets, epoch_num=epoch, num_classes=num_classes,
                     annealing_step=args.annealing_step, device=device, lam=args.redl_lambda,
                 )
             elif args.loss_fn == "fedl":
                 alpha, p, tau = output
-                loss = fedl_loss(alpha, p, tau, labels, num_classes)
+                loss = fedl_loss(
+                    alpha,
+                    p,
+                    tau,
+                    targets,
+                    num_classes,
+                )
             elif args.loss_fn == "softmax":
-                loss = nn.functional.cross_entropy(output, labels)
+                loss = nn.functional.cross_entropy(output, targets)
             else:
                 raise ValueError(f"Unsupported loss function: {args.loss_fn}")
 
