@@ -1,5 +1,5 @@
 """
-Train an EDL-head, R-EDL-head, or softmax backbone on HAM10000.
+Train an EDL-head, R-EDL-head, F-EDL-head, or softmax backbone on HAM10000.
 
 Supported loss functions:
     - edl
@@ -33,7 +33,7 @@ Example R-EDL run:
         --batch_size 32 \
         --lr 1e-4 \
         --annealing_step 10 \
-        --patience 5 \
+        --patience 8 \
         --checkpoint_dir checkpoints \
         --log_path results/framework_screening.csv
 """
@@ -65,9 +65,15 @@ from losses.evidential_loss import (
     redl_predictions,
 )
 
+from losses.fedl_loss import (
+    fedl_loss,
+    fedl_predictions,
+)
+
 from metrics.ece import compute_ece
 
 from models.backbone_factory import get_backbone
+from models.fedl_wrapper import FEDLWrapper
 
 
 # ============================================================
@@ -91,7 +97,7 @@ def set_seed(seed: int):
 def parse_args():
 
     p = argparse.ArgumentParser(
-        description="Train EDL, R-EDL, or Softmax model on HAM10000."
+        description="Train EDL, R-EDL, F-EDL, or Softmax model on HAM10000."
     )
 
     # --------------------------------------------------------
@@ -119,6 +125,7 @@ def parse_args():
             "edl",
             "redl",
             "softmax",
+            "fedl",
         ],
     )
 
@@ -522,6 +529,9 @@ def load_checkpoint_if_exists(
             f"{ckpt.get('redl_lambda', 'unknown')}"
         )
 
+    if ckpt.get("loss_fn") == "fedl":
+        print("Checkpoint F-EDL configuration detected.")
+
     print(
         f"Previous best validation accuracy: "
         f"{best_metric:.4f} "
@@ -547,13 +557,7 @@ def evaluate(
     loss_fn,
     redl_lambda=0.1,
 ):
-    """
-    Evaluate model using:
-
-        - Accuracy
-        - ECE
-        - Reliability-diagram bin data
-    """
+    """Evaluate accuracy, ECE, and reliability-diagram bins."""
 
     model.eval()
 
@@ -562,93 +566,43 @@ def evaluate(
     all_label = []
 
     with torch.no_grad():
-
         for images, labels in loader:
-
-            images = images.to(
-                device
-            )
-
-            output = model(
-                images
-            )
-
-            # ------------------------------------------------
-            # Standard EDL
-            # ------------------------------------------------
+            images = images.to(device)
+            output = model(images)
 
             if loss_fn == "edl":
-
-                pred_class, confidence, _ = (
-                    edl_predictions(
-                        output
-                    )
-                )
-
-            # ------------------------------------------------
-            # R-EDL
-            # ------------------------------------------------
+                pred_class, confidence, _ = edl_predictions(output)
 
             elif loss_fn == "redl":
-
-                pred_class, confidence, _ = (
-                    redl_predictions(
-                        output,
-                        lam=redl_lambda,
-                    )
+                pred_class, confidence, _ = redl_predictions(
+                    output, lam=redl_lambda
                 )
 
-            # ------------------------------------------------
-            # Softmax
-            # ------------------------------------------------
+            elif loss_fn == "fedl":
+                alpha, p, tau = output
+                (
+                    pred_class,
+                    confidence,
+                    _total_uncertainty,
+                    _epistemic_uncertainty,
+                    _aleatoric_uncertainty,
+                ) = fedl_predictions(alpha, p, tau)
+
+            elif loss_fn == "softmax":
+                probs = torch.softmax(output, dim=1)
+                confidence, pred_class = torch.max(probs, dim=1)
 
             else:
+                raise ValueError(f"Unsupported loss function: {loss_fn}")
 
-                probs = torch.softmax(
-                    output,
-                    dim=1,
-                )
+            all_conf.extend(confidence.detach().cpu().numpy())
+            all_pred.extend(pred_class.detach().cpu().numpy())
+            all_label.extend(labels.cpu().numpy())
 
-                confidence, pred_class = (
-                    torch.max(
-                        probs,
-                        dim=1,
-                    )
-                )
+    all_pred = np.array(all_pred)
+    all_label = np.array(all_label)
 
-            all_conf.extend(
-                confidence.cpu().numpy()
-            )
-
-            all_pred.extend(
-                pred_class.cpu().numpy()
-            )
-
-            all_label.extend(
-                labels.numpy()
-            )
-
-    all_pred = np.array(
-        all_pred
-    )
-
-    all_label = np.array(
-        all_label
-    )
-
-    # --------------------------------------------------------
-    # Accuracy
-    # --------------------------------------------------------
-
-    accuracy = float(
-        np.mean(
-            all_pred == all_label
-        )
-    )
-
-    # --------------------------------------------------------
-    # ECE
-    # --------------------------------------------------------
+    accuracy = float(np.mean(all_pred == all_label))
 
     ece, bin_data = compute_ece(
         all_conf,
@@ -657,11 +611,7 @@ def evaluate(
         n_bins=15,
     )
 
-    return (
-        accuracy,
-        ece,
-        bin_data,
-    )
+    return accuracy, ece, bin_data
 
 
 # ============================================================
@@ -834,6 +784,13 @@ def main():
         print(
             f"R-EDL lambda: "
             f"{args.redl_lambda}"
+        )
+
+    if args.loss_fn == "fedl":
+
+        print(
+            "F-EDL: controlled adaptation; "
+            "spectral normalization is not enabled."
         )
 
     # ========================================================
@@ -1112,11 +1069,26 @@ def main():
     # Model
     # ========================================================
 
-    model = get_backbone(
-        args.backbone,
-        num_classes=num_classes,
-        pretrained=True,
-    ).to(device)
+    if args.loss_fn == "fedl":
+
+        model = FEDLWrapper(
+            backbone_name=args.backbone,
+            num_classes=num_classes,
+            pretrained=True,
+        ).to(device)
+
+        print(
+            "F-EDL mode: using FEDLWrapper "
+            "(alpha, p, tau outputs)."
+        )
+
+    else:
+
+        model = get_backbone(
+            args.backbone,
+            num_classes=num_classes,
+            pretrained=True,
+        ).to(device)
 
     # ========================================================
     # Optimizer
@@ -1181,6 +1153,11 @@ def main():
     # Training loop
     # ========================================================
 
+    # The loop may execute zero times when a completed latest
+    # checkpoint is resumed. Keeping an explicit epoch value for
+    # logging and final reporting.
+    last_epoch = start_epoch - 1
+
     for epoch in range(
         start_epoch,
         args.epochs + 1,
@@ -1244,14 +1221,35 @@ def main():
                 )
 
             # =================================================
+            # F-EDL
+            # =================================================
+
+            elif args.loss_fn == "fedl":
+
+                alpha, p, tau = output
+
+                loss = fedl_loss(
+                    alpha,
+                    p,
+                    tau,
+                    labels,
+                    num_classes,
+                )
+
+            # =================================================
             # Softmax
             # =================================================
 
-            else:
+            elif args.loss_fn == "softmax":
 
                 loss = nn.functional.cross_entropy(
                     output,
                     labels,
+                )
+
+            else:
+                raise ValueError(
+                    f"Unsupported loss function: {args.loss_fn}"
                 )
 
             # ------------------------------------------------
@@ -1304,6 +1302,8 @@ def main():
             f"val_ece={val_ece:.4f} | "
             f"{elapsed:.1f}s"
         )
+
+        last_epoch = epoch
 
         # ====================================================
         # Best-model detection
@@ -1475,7 +1475,7 @@ def main():
             args.seed,
 
         "epochs":
-            epoch,
+            last_epoch,
 
         "batch_size":
             args.batch_size,
@@ -1557,6 +1557,12 @@ def main():
         print(
             f"R-EDL lambda             : "
             f"{args.redl_lambda}"
+        )
+
+    if args.loss_fn == "fedl":
+        print(
+            "F-EDL adaptation         : "
+            "controlled, no spectral normalization"
         )
 
     print(
