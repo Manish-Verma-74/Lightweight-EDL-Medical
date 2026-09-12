@@ -521,12 +521,12 @@ def main():
     if args.dataset != "ham10000":
         raise NotImplementedError("Only ham10000 is supported in this pipeline.")
 
-    if args.augmentation in {"mixup", "cutmix"} and args.loss_fn != "fedl":
+   #if args.augmentation in {"mixup", "cutmix"} and args.loss_fn != "fedl":
         raise ValueError(
             f"Augmentation '{args.augmentation}' produces soft targets [B, K], "
             f"which is currently supported only with '--loss_fn fedl'. "
             f"Use 'standard' or 'randaugment' for loss_fn='{args.loss_fn}'."
-        )
+        ) #
 
     num_classes = len(CLASS_NAMES)
 
@@ -664,6 +664,9 @@ def main():
                     num_classes,
                 )
             elif args.loss_fn == "softmax":
+                if targets.dim() == 2:
+                    targets = targets.float()
+                    
                 loss = nn.functional.cross_entropy(output, targets)
             else:
                 raise ValueError(f"Unsupported loss function: {args.loss_fn}")

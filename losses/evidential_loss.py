@@ -21,6 +21,50 @@ import torch
 import torch.nn.functional as F
 
 
+def get_target_onehot(
+    target: torch.Tensor,
+    num_classes: int,
+    device: torch.device
+) -> torch.Tensor:
+    """
+    Backward-compatible target adapter with strict soft-target validation.
+
+    Supported target formats:
+        [B]    integer class labels
+        [B,K]  soft/probability targets (values in [0, 1], row sums == 1.0)
+    """
+    if target.dim() == 1:
+        return F.one_hot(
+            target,
+            num_classes=num_classes
+        ).float().to(device)
+
+    elif target.dim() == 2:
+        if target.shape[1] != num_classes:
+            raise ValueError(
+                f"Expected target shape [B, {num_classes}], "
+                f"got {tuple(target.shape)}"
+            )
+
+        target = target.float().to(device)
+
+        if torch.any(target < 0.0) or torch.any(target > 1.0):
+            raise ValueError("Soft targets must lie within [0.0, 1.0].")
+
+        row_sums = target.sum(dim=1)
+        ones = torch.ones(target.shape[0], device=device)
+        if not torch.allclose(row_sums, ones, atol=1e-5):
+            raise ValueError("Each soft-target row must sum to 1.0.")
+
+        return target
+
+    else:
+        raise ValueError(
+            "Target tensor must be 1D [B] or "
+            f"2D [B, K], got shape {tuple(target.shape)}"
+        )
+
+
 def relu_evidence(y: torch.Tensor) -> torch.Tensor:
     """Map raw network outputs to non-negative 'evidence'."""
     return F.relu(y)
@@ -53,7 +97,7 @@ def edl_mse_loss(
     """
     Args:
         output: raw model output, shape (batch, num_classes) -- NOT softmax'd
-        target: integer class labels, shape (batch,)
+        target: integer class labels (batch,) or soft targets (batch, num_classes)
         epoch_num: current epoch (used to anneal the KL term in slowly)
         num_classes: number of classes K
         annealing_step: epoch at which the KL weight reaches 1.0
@@ -64,17 +108,16 @@ def edl_mse_loss(
     S = torch.sum(alpha, dim=1, keepdim=True)
     m = alpha / S
 
-    target_onehot = F.one_hot(target, num_classes).float().to(device)
+    target_onehot = get_target_onehot(target, num_classes, device)
 
-    # A: squared error between predicted expected prob and one-hot target
+    # A: squared error between predicted expected prob and target matrix
     A = torch.sum((target_onehot - m) ** 2, dim=1, keepdim=True)
     # B: expected variance of the Dirichlet -- penalizes evidence spread across wrong classes
     B = torch.sum(alpha * (S - alpha) / (S * S * (S + 1)), dim=1, keepdim=True)
 
     annealing_coef = min(1.0, float(epoch_num) / float(annealing_step))
 
-    # Remove evidence for the TRUE class before computing KL, so we only
-    # penalize evidence sitting on the wrong classes.
+    # Remove evidence for the target classes before computing KL
     alpha_tilde = evidence * (1 - target_onehot) + 1
     C = annealing_coef * kl_divergence(alpha_tilde, num_classes, device)
 
@@ -108,37 +151,16 @@ def redl_loss(
     lam: float = 0.1,
 ) -> torch.Tensor:
     """
-    R-EDL loss based on Chen, Gao, and Xu, ICLR 2024,
-    "R-EDL: Relaxing Nonessential Settings of Evidential Deep Learning."
-    Paper: https://proceedings.iclr.cc/paper_files/paper/2024/file/98f8c89ae042c512e6c87e0e0c2a0f98-Paper-Conference.pdf
-    Code:  https://github.com/MengyuanChen21/ICLR2024-REDL
-
-    R-EDL makes two principal changes to Standard EDL:
-    1. Generalized prior weight: alpha = evidence + lambda
-       instead of the fixed: alpha = evidence + 1
-    2. Removes the variance-minimizing term from the standard Dirichlet
-       MSE objective and directly minimizes the squared error between
-       the projected Dirichlet mean P = alpha / S and the one-hot target.
-    The KL regularization term is retained.
-
-    Experimental-control decisions in this implementation (not part of
-    the R-EDL method itself -- see thesis methods section):
-    - ReLU is retained as the evidence activation to match our existing
-      Standard EDL implementation. The original R-EDL experiments use
-      Softplus.
-    - The KL annealing schedule is retained from our Standard EDL
-      implementation because the R-EDL paper does not specify this
-      schedule explicitly. This keeps the comparison controlled.
+    R-EDL loss based on Chen, Gao, and Xu, ICLR 2024.
     """
     evidence = relu_evidence(output)
     alpha = evidence + lam                        # Eq. 9: generalized alpha
     S = torch.sum(alpha, dim=1, keepdim=True)
     P = alpha / S                                  # projected probability
 
-    target_onehot = F.one_hot(target, num_classes).float().to(device)
+    target_onehot = get_target_onehot(target, num_classes, device)
 
     # Direct squared error on projected probability.
-    # IMPORTANT: R-EDL removes the variance-minimizing term.
     L_redl = torch.sum((target_onehot - P) ** 2, dim=1, keepdim=True)
 
     annealing_coef = min(1.0, float(epoch_num) / float(max(1, annealing_step)))
@@ -153,13 +175,6 @@ def redl_loss(
 def redl_predictions(output: torch.Tensor, lam: float = 0.1):
     """
     R-EDL prediction and uncertainty.
-
-    Uncertainty follows the CORRECTION reported by the authors in the
-    official R-EDL repository README (not the paper PDF, which omits
-    lambda in the equation below Eq. 9):
-        u = lambda * K / S
-    Treat this as a repository-derived implementation detail, not
-    simply "the R-EDL uncertainty formula" from the published paper.
     """
     evidence = relu_evidence(output)
     alpha = evidence + lam
