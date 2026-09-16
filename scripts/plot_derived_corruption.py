@@ -21,9 +21,6 @@ df_raw = pd.read_csv(RAW_CSV)
 df_s5 = df_raw[df_raw['severity'] == 5].copy()
 df_s5['gap'] = (df_s5['mean_confidence'] * 100) - df_s5['accuracy']
 
-# Calculate ECE increase from summary
-df_summary['ece_increase'] = df_summary['ece_s5'] - df_summary['ece_clean']
-
 # 2. Plotting configurations
 corruptions = ['Gaussian noise', 'Gaussian blur', 'brightness', 'contrast']
 x_labels = ['Noise (S5)', 'Blur (S5)', 'Brightness (S5)', 'Contrast (S5)']
@@ -42,7 +39,6 @@ def get_metric_list(df, model_name, metric_col, corruptions_list):
     
     for c in corruptions_list:
         val = model_df.loc[model_df['corruption'] == c, metric_col].values
-        
         if len(val) != 1:
             raise ValueError(
                 f"Expected exactly 1 value for model='{model_name}', "
@@ -64,9 +60,26 @@ axes[0].set_xticklabels(x_labels, rotation=45, ha="right")
 axes[0].legend(loc='lower left', title="Configuration")
 axes[0].grid(axis='y', linestyle='--', alpha=0.7)
 
-# Plot 2: ECE Increase (from stage5_summary)
+# Plot 2: ECE Increase (Computed safely from raw data)
 for i, model in enumerate(models):
-    vals = get_metric_list(df_summary, model, 'ece_increase', corruptions)
+    model_raw = df_raw[df_raw['model'] == model]
+    
+    # Get Clean ECE (Severity 0)
+    clean_ece_series = model_raw[model_raw['severity'] == 0]['ece'].values
+    if len(clean_ece_series) == 0:
+        raise ValueError(f"Could not find severity=0 (clean) row for {model}")
+    clean_ece = float(clean_ece_series[0])
+    
+    vals = []
+    for c in corruptions:
+        # Get Severity 5 ECE
+        s5_ece_series = model_raw[(model_raw['corruption'] == c) & (model_raw['severity'] == 5)]['ece'].values
+        if len(s5_ece_series) != 1:
+            raise ValueError(f"Missing exactly 1 severity=5 row for {model}, {c}")
+        s5_ece = float(s5_ece_series[0])
+        
+        vals.append(s5_ece - clean_ece)
+        
     axes[1].bar(x + i*width, vals, width, label=model, color=colors[i], edgecolor='black', linewidth=0.5)
 
 axes[1].set_title('ECE Increase: Clean → Severity 5')
