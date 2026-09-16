@@ -394,7 +394,7 @@ for name in selected_ood:
     labels.extend([f"{name}\nID", f"{name}\nNear-OOD"])
 
 # FIX 7: showfliers=True to reveal long-tail distribution behaviors
-plt.boxplot(plot_data, labels=labels, showfliers=True)
+plt.boxplot(plot_data, tick_labels=labels, showfliers=True)
 plt.ylabel("Uncertainty Score")
 plt.title("ID vs Near-OOD Uncertainty — EfficientNet-B0")
 plt.xticks(rotation=25, ha="right")
@@ -415,7 +415,7 @@ for name in selected_ood:
     plot_data.extend([data["id_uncertainty"], data["far_uncertainty"]])
     labels.extend([f"{name}\nID", f"{name}\nFar-OOD"])
 
-plt.boxplot(plot_data, labels=labels, showfliers=True)
+plt.boxplot(plot_data, tick_labels=labels, showfliers=True)
 plt.ylabel("Uncertainty Score")
 plt.title("ID vs Far-OOD Uncertainty — EfficientNet-B0")
 plt.xticks(rotation=25, ha="right")
