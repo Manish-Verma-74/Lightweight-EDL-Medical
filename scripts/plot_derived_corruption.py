@@ -21,8 +21,8 @@ df_raw = pd.read_csv(RAW_CSV)
 df_s5 = df_raw[df_raw['severity'] == 5].copy()
 df_s5['gap'] = (df_s5['mean_confidence'] * 100) - df_s5['accuracy']
 
-# 2. Plotting configurations
-corruptions = ['Gaussian noise', 'Gaussian blur', 'brightness', 'contrast']
+# 2. Plotting configurations - MATCHED TO CSV OUTPUT
+corruptions = ['gaussian_noise', 'gaussian_blur', 'brightness', 'contrast']
 x_labels = ['Noise (S5)', 'Blur (S5)', 'Brightness (S5)', 'Contrast (S5)']
 models = ['Softmax + CutMix', 'F-EDL + Standard', 'F-EDL + CutMix']
 colors = ['#4C72B0', '#DD8452', '#55A868']
