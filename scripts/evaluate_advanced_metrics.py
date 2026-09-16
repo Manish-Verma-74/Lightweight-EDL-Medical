@@ -1,16 +1,25 @@
 import os
+import sys
 import torch
 import numpy as np
 import pandas as pd
 from torch.utils.data import DataLoader, Subset
 from sklearn.model_selection import StratifiedGroupKFold
 
-# Import existing modules
+# --- ADD THIS BLOCK TO FIX MODULE IMPORTS ---
+# Dynamically add the project root to sys.path so Python can find your custom modules
+current_dir = os.path.dirname(os.path.abspath(__file__))
+repo_root = os.path.dirname(current_dir)  # Goes one level up to Lightweight-EDL-Medical
+if repo_root not in sys.path:
+    sys.path.insert(0, repo_root)
+# --------------------------------------------
+
+# Now Python can successfully find these:
 from datasets.ham10000 import HAM10000Dataset, default_transforms
 from models.backbone_factory import get_backbone
 from models.fedl_wrapper import FEDLWrapper
 from losses.fedl_loss import fedl_predictions
-from metrics.ece import compute_ece 
+from metrics.ece import compute_ece
 
 def safe_nanmean(x):
     """Safely computes nanmean to avoid RuntimeWarning on all-NaN slices."""
