@@ -65,7 +65,9 @@ print("\nLoading Datasets...")
 transform = default_transforms(train=False)
 
 # ID
-ham_data = HAM10000Dataset("/content/data/ham10000", transform=transform)
+# 1. HAM10000 (Local Drive path)
+ham_data_dir = os.path.join(PROJECT_ROOT, "data", "ham10000")
+ham_data = HAM10000Dataset(ham_data_dir, transform=transform)
 sgkf = StratifiedGroupKFold(n_splits=7, shuffle=True, random_state=42)
 _, val_idx = next(sgkf.split(np.arange(len(ham_data)), ham_data.labels, groups=ham_data.metadata["lesion_id"].values))
 id_loader = DataLoader(Subset(ham_data, val_idx), batch_size=BATCH_SIZE, shuffle=False)
@@ -97,11 +99,20 @@ ood_transform = transforms.Compose([
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
-pad_dataset = PADUFES20Dataset("/content/data/pad_ufes20", transform=ood_transform)
+# 2. PAD-UFES-20 (Local Drive path - note the exact casing/hyphens)
+pad_data_dir = os.path.join(PROJECT_ROOT, "data", "PAD-UFES-20")
+pad_dataset = PADUFES20Dataset(pad_data_dir, transform=ood_transform)
 near_loader = DataLoader(pad_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
-# Far-OOD
-cifar_dataset = CIFAR100(root="/content/data/cifar100", train=False, download=False, transform=ood_transform)
+# Far-OOD:
+
+#3. CIFAR-100 (Downloaded automatically to Colab local runtime storage)
+cifar_dataset = CIFAR100(
+    root="/content/data/cifar100",
+    train=False,
+    download=True,
+    transform=ood_transform
+)
 far_loader = DataLoader(cifar_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
 assert len(val_idx) == 1441 and len(pad_dataset) == 2298 and len(cifar_dataset) == 10000
