@@ -43,7 +43,8 @@
     "total_runs": 144,
     "run_id_pattern": "{backbone}__{framework}__{augmentation}__seed{seed}",
     "run_manifest": "protocol/run_manifest_v1.csv",
-    "assert_unique_run_ids": true
+    "assert_unique_run_ids": true,
+    "run_manifest_sha256": "36bc2026ffdbabe82a702b39f8c38f43f4b8bce42455603408ed211b678a1c6c"
   },
   "data": {
     "dataset": "HAM10000",
