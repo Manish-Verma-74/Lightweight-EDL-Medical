@@ -1,0 +1,454 @@
+{
+  "protocol_version": "v1",
+  "status": "DRAFT - not frozen until preflight_blockers are cleared, committed and tagged",
+  "freeze": {
+    "git_commit": "TO_FILL_BEFORE_FREEZE",
+    "git_tag": "protocol-v1",
+    "frozen_on": "TO_FILL_BEFORE_FREEZE"
+  },
+  "study": {
+    "title": "Calibration Robustness of Lightweight Evidential Deep Learning under Data Augmentation and Progressive Image Degradation in Medical Image Classification",
+    "type": "empirical interaction study; no claim of a new method or a universal winner"
+  },
+  "matrix": {
+    "backbones": [
+      "efficientnet_b0",
+      "mobilenet_v3_small",
+      "shufflenet_v2"
+    ],
+    "frameworks": [
+      "softmax",
+      "edl",
+      "r_edl",
+      "f_edl"
+    ],
+    "augmentations": [
+      "base_flips",
+      "mixup",
+      "cutmix",
+      "randaugment"
+    ],
+    "augmentation_display_names": {
+      "base_flips": "Base (flips)",
+      "mixup": "Mixup",
+      "cutmix": "CutMix",
+      "randaugment": "RandAugment"
+    },
+    "training_seeds": [
+      42,
+      123,
+      2024
+    ],
+    "configurations": 48,
+    "total_runs": 144,
+    "run_id_pattern": "{backbone}__{framework}__{augmentation}__seed{seed}",
+    "run_manifest": "protocol/run_manifest_v1.csv",
+    "assert_unique_run_ids": true
+  },
+  "data": {
+    "dataset": "HAM10000",
+    "metadata_path_in_repo_data_dir": "data/ham10000/HAM10000_metadata.csv",
+    "metadata_md5": "70bb67f71bd23dde0bd2eda4bdcc98e5",
+    "images": 10015,
+    "lesions": 7470,
+    "classes": [
+      "akiec",
+      "bcc",
+      "bkl",
+      "df",
+      "mel",
+      "nv",
+      "vasc"
+    ],
+    "class_counts": {
+      "akiec": 327,
+      "bcc": 514,
+      "bkl": 1099,
+      "df": 115,
+      "mel": 1113,
+      "nv": 6705,
+      "vasc": 142
+    },
+    "missing_image_policy": "abort with a report; never silently filter",
+    "split": {
+      "manifest": "protocol/split_manifest_v1.csv",
+      "sha256": "df7be4c42d83eb678a3eceef6772cd752a7654086787351ebef0552344ce894c",
+      "hash_rule": "normalize CRLF to LF before hashing; abort on mismatch",
+      "generator": {
+        "class": "StratifiedGroupKFold",
+        "n_splits": 7,
+        "shuffle": true,
+        "random_state": 42,
+        "groups": "lesion_id",
+        "stratify_on": "dx",
+        "sklearn_version": "1.6.1"
+      },
+      "roles": {
+        "train_folds": [
+          0,
+          1,
+          2,
+          5,
+          6
+        ],
+        "validation_fold": 4,
+        "test_fold": 3
+      },
+      "expected_counts": {
+        "train": 7179,
+        "validation": 1400,
+        "test": 1436
+      },
+      "required_assertions": [
+        "zero lesion overlap for every partition pair",
+        "every image in exactly one partition",
+        "historical pilot validation IDs (old fold 0) fall entirely in train"
+      ],
+      "no_script_may_regenerate_the_split": true,
+      "test_set_history_note": "Test images were part of pilot training sets but were never used to evaluate or select anything; they are held out from the 144-run study."
+    },
+    "preprocessing": {
+      "train_base": [
+        "Resize((224,224)) direct, no padding",
+        "RandomHorizontalFlip",
+        "RandomVerticalFlip",
+        "ToTensor",
+        "Normalize ImageNet mean/std"
+      ],
+      "eval": [
+        "Resize((224,224)) direct",
+        "ToTensor",
+        "Normalize ImageNet mean/std"
+      ],
+      "same_eval_preprocessing_for": [
+        "validation",
+        "test",
+        "OOD",
+        "corruption"
+      ],
+      "limitation": "Direct resize distorts the 4:3 aspect ratio; documented, matches pilots"
+    }
+  },
+  "augmentation_parameters": {
+    "mixup": {
+      "alpha": 0.2
+    },
+    "cutmix": {
+      "alpha": 1.0,
+      "label_weight": "recomputed from the actual clipped box area"
+    },
+    "randaugment": {
+      "num_ops": 2,
+      "magnitude": 9
+    },
+    "all_augmentations_build_on": "train_base"
+  },
+  "training": {
+    "optimizer": "AdamW",
+    "learning_rate": 0.0001,
+    "weight_decay": 0.01,
+    "scheduler": "none",
+    "batch_size": 32,
+    "max_epochs": 50,
+    "max_epochs_status": "provisional until convergence_pilot is evaluated; one value for all 144 runs",
+    "early_stopping_patience": 8,
+    "checkpoint_selection": {
+      "metric": "validation macro-F1",
+      "tie_break": "earliest epoch",
+      "reload_best_before_final_evaluation": true
+    },
+    "class_balancing": "WeightedRandomSampler on training set only",
+    "initialization": "ImageNet pretrained",
+    "redl_lambda": 0.1,
+    "edl_kl_annealing": "coefficient = min(1, epoch / 10)",
+    "fedl_variant": "controlled adaptation, no spectral normalization",
+    "split_seed": 42,
+    "seeds_control": [
+      "python",
+      "numpy",
+      "torch",
+      "cuda",
+      "WeightedRandomSampler",
+      "DataLoader workers"
+    ],
+    "checkpoint_contents": [
+      "model",
+      "optimizer",
+      "epoch",
+      "best score and epoch",
+      "early-stopping counter",
+      "RNG states",
+      "split sha256",
+      "config hash",
+      "code commit"
+    ],
+    "resume_policy": "refuse to resume if split hash, config hash or commit differ; exact bitwise resume not claimed",
+    "log_file": "final_factorial_v1.csv",
+    "log_schema_mismatch": "hard error",
+    "duplicate_run_id": "reject",
+    "record_per_run": [
+      "gpu_model",
+      "package versions",
+      "commit",
+      "attempt number"
+    ]
+  },
+  "failure_policy": "Interruption: resume same run, same seed. NaN or invalid output: record and investigate, never swap seeds. A code defect requires a protocol version bump and rerun of affected runs.",
+  "prediction_protocol": {
+    "classification_probabilities": {
+      "softmax": "q_k = softmax(logits)_k",
+      "edl": "q_k = alpha_k / S, S = sum_j alpha_j",
+      "r_edl": "q_k = alpha_k / S, S = sum_j alpha_j",
+      "f_edl": "mu_k = (alpha_k + tau * p_k) / (sum_j alpha_j + tau)"
+    },
+    "native_ood_scores": {
+      "softmax": "1 - max_k(q_k)",
+      "edl": "vacuity = K / S",
+      "r_edl": "vacuity = K / S",
+      "f_edl": "epistemic = sum_k var_k from losses/fedl_loss.py::compute_moments"
+    },
+    "f_edl_secondary_score": "total = 1 - sum_k(mu_k^2)",
+    "common_scores": {
+      "msp_uncertainty": "1 - max_k(q_k)",
+      "predictive_entropy": "-sum_k q_k log q_k"
+    },
+    "orientation": "higher = more likely OOD"
+  },
+  "metrics": {
+    "ece": {
+      "bins": 15,
+      "binning": "equal width on [0,1]",
+      "empty_bins": "ignored"
+    },
+    "macro_cw_ece": {
+      "classes": 7,
+      "bins": 15,
+      "method": "one-vs-rest per class, unweighted mean"
+    },
+    "brier": "mean over samples of sum_k (q_ik - y_ik)^2, not divided by K",
+    "ood": {
+      "positive_class": "OOD",
+      "auroc": "primary",
+      "fpr95": "fraction of ID at or above the threshold giving 95% OOD recall",
+      "aupr": "secondary, always report OOD prevalence"
+    },
+    "risk_coverage": {
+      "curves_and_aurc": true,
+      "scores": [
+        "native",
+        "msp",
+        "entropy"
+      ]
+    }
+  },
+  "primary_contrasts": {
+    "P1_cutmix_vs_base_ece": {
+      "outcome": "test ECE(CutMix) - ECE(Base flips), one contrast per framework (four co-primary)",
+      "per_seed_estimate": "mean over 3 backbones (3 matched pairs per framework per seed)",
+      "headline": "mean and SD of the 3 seed-specific estimates",
+      "hypotheses": {
+        "softmax": "negative",
+        "f_edl": "negative",
+        "edl": "positive",
+        "r_edl": "positive"
+      },
+      "multiplicity": "report all four; use 98.75% percentile intervals (Bonferroni, 4 contrasts) for this family",
+      "disclosure": "framework separation and directions were informed by validation-fold pilots"
+    },
+    "P2_fedl_vs_softmax_pad_ufes20_auroc": {
+      "outcome": "AUROC(F-EDL native epistemic) - AUROC(Softmax MSP) on PAD-UFES-20",
+      "augmentation": "base_flips",
+      "per_seed_estimate": "mean over 3 backbones (3 pairs)",
+      "hypothesis": "positive",
+      "bootstrap": "joint resampling of HAM10000 test lesions and PAD-UFES-20 clusters (patient_id / lesion_id)"
+    },
+    "P4_cutmix_vs_base_corruption_ece_degradation": {
+      "outcome": "mean over 20 corrupted conditions of (ECE_corrupt - ECE_clean), CutMix minus Base flips",
+      "frameworks": [
+        "softmax",
+        "f_edl"
+      ],
+      "backbones": [
+        "efficientnet_b0",
+        "mobilenet_v3_small"
+      ],
+      "per_seed_estimate": "mean over 4 pairs",
+      "hypothesis": "negative",
+      "clean_role": "reference only"
+    }
+  },
+  "descriptive_analyses": {
+    "P3_efficiency": {
+      "status": "descriptive, no hypothesis test",
+      "reference": "efficientnet_b0",
+      "report_with": [
+        "Macro-F1",
+        "ECE",
+        "near-OOD AUROC",
+        "params",
+        "checkpoint MB",
+        "FLOPs",
+        "GPU latency",
+        "CPU latency"
+      ],
+      "composite_score": false
+    },
+    "melanoma": {
+      "positive_class": "mel",
+      "specificity_targets": [
+        0.9,
+        0.95
+      ],
+      "coverage_targets": [
+        0.8,
+        0.9
+      ],
+      "thresholds_from": "validation predictions only"
+    }
+  },
+  "statistics": {
+    "seed_variation": "report three seed-specific estimates, mean and SD",
+    "bootstrap": {
+      "unit": "lesion_id",
+      "replicates_per_seed": 2000,
+      "rng_seed": 20261009,
+      "interval": "95% percentile (98.75% for P1 family)",
+      "paired": true,
+      "within_seed_only": true,
+      "no_pooling_across_seeds": true
+    },
+    "pilot_selection_disclosure": "Core comparisons were chosen after pilot evaluation on the historical validation fold, not on the new test partition.",
+    "temperature_scaling": {
+      "primary": false,
+      "secondary": "two-fold cross-fit inside the validation fold; no split change"
+    },
+    "split_sensitivity": {
+      "status": "secondary",
+      "method": "retrain 1-2 pre-specified configs with different fold roles; do not alter the primary study",
+      "configs": "TO_FILL_BEFORE_FREEZE"
+    }
+  },
+  "ood": {
+    "id_reference_set": "HAM10000 test partition (1436)",
+    "use_all_ood_images_for_primary_metrics": true,
+    "aupr_note": "AUROC and FPR95 do not depend on prevalence; report AUPR with prevalence, plus a fixed-seed balanced subsample as secondary",
+    "pad_ufes_20": {
+      "source": "Mendeley Data v1",
+      "doi_url": "https://data.mendeley.com/datasets/zr7vgbcyr2/1",
+      "description": "domain/acquisition shift with overlapping diagnostic classes, not pure semantic OOD",
+      "manifest_with_hashes": "TO_FILL_BEFORE_FREEZE"
+    },
+    "cifar100": {
+      "split": "official test set (10000)",
+      "resize": [
+        224,
+        224
+      ],
+      "interpolation": "bilinear",
+      "limitation": "upsampled 32x32 images are blurry; far-OOD AUROC may be optimistic"
+    }
+  },
+  "corruption_study": {
+    "configs": "2 backbones x 2 frameworks x 2 augmentations = 8 (efficientnet_b0, mobilenet_v3_small; softmax, f_edl; base_flips, cutmix)",
+    "types": [
+      "gaussian_noise",
+      "gaussian_blur",
+      "brightness",
+      "contrast"
+    ],
+    "severities": [
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "parameter_values_per_severity": "TO_FILL_BEFORE_FREEZE",
+    "conditions": "20 corrupted + clean reference",
+    "manifest_hash": "TO_FILL_BEFORE_FREEZE",
+    "bundles": "one compressed .npz per model run (24 runs)"
+  },
+  "efficiency_benchmarks": {
+    "scope": "12 unique backbone/framework combinations",
+    "gpu": "NVIDIA Tesla T4 only; do not mix GPU models",
+    "precision": "FP32",
+    "mode": "eval",
+    "input": [
+      1,
+      3,
+      224,
+      224
+    ],
+    "warmup": 50,
+    "timed": 200,
+    "synchronize_gpu": true,
+    "cpu_threads": 1,
+    "summary": "median and IQR",
+    "flops_tool": "TO_FILL_BEFORE_FREEZE (pin exact installable version string)",
+    "record_machine": true
+  },
+  "prediction_exports": {
+    "format": "one compressed .npz per run",
+    "dtype": "float32",
+    "contents": [
+      "IDs",
+      "labels",
+      "logits",
+      "probabilities",
+      "alpha/p/tau where applicable",
+      "validation",
+      "test",
+      "PAD-UFES-20",
+      "CIFAR-100",
+      "run id, seed, checkpoint id, split hash"
+    ]
+  },
+  "convergence_pilot": {
+    "configs": [
+      "efficientnet_b0 + r_edl + cutmix",
+      "mobilenet_v3_small + f_edl + mixup",
+      "shufflenet_v2 + f_edl + mixup"
+    ],
+    "seed": 42,
+    "data": "train and validation only, final code, final split",
+    "counted_in_144": false,
+    "extend_cap_to_60_if": "any pilot has best validation macro-F1 at epoch 46 or later, or reaches epoch 50 without early stopping",
+    "patience_if_extended": 8
+  },
+  "chest_xray_secondary_study": {
+    "status": "secondary; freeze before examining HAM10000 test results",
+    "backbones": [
+      "efficientnet_b0",
+      "mobilenet_v3_small"
+    ],
+    "configs": [
+      "softmax + CXR-Base",
+      "f_edl + CXR-Base",
+      "f_edl + cutmix"
+    ],
+    "seeds": [
+      42,
+      123,
+      2024
+    ],
+    "runs": 18,
+    "selection_metric": "validation macro-F1",
+    "cxr_base": "Resize 224x224, rotation +/-5 deg, translate up to 5%, grayscale to 3 channels, ImageNet normalize, no flips",
+    "cutmix_alpha": 1.0,
+    "split": "patient-grouped, proportions TO_FILL_BEFORE_FREEZE",
+    "near_ood": "TB-positive images only from Shenzhen and Montgomery",
+    "far_ood": [
+      "CIFAR-100",
+      "HAM10000"
+    ]
+  },
+  "decision_gate": "After primary results, record 1-3 follow-up questions in protocol/followup_questions.md before running extra analyses",
+  "preflight_blockers": [
+    "unit tests: q and native score per framework vs hand-computed examples",
+    "audit legacy OOD scripts against the frozen native scores",
+    "enumerate and hash the 20 corruption conditions with parameter values",
+    "freeze PAD-UFES-20 file/label manifest and hashes",
+    "measure checkpoint and prediction sizes in the smoke test",
+    "pin and verify the FLOPs tool version string"
+  ]
+}
