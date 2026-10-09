@@ -1,2 +1,26 @@
-__pycache__/
-*.pyc
+# Dataset and generated experiment artifacts
+
+/data/
+/checkpoints/
+/results/
+/repo_backup/
+
+# Model checkpoints
+
+*.pt
+*.pth
+
+# Python-generated files
+
+**pycache**/
+*.py[cod]
+
+# Temporary backup scripts
+
+/scripts/evaluate_advanced_metrics_backup_*.py
+
+# Local environments and secrets
+
+.venv/
+venv/
+.env
